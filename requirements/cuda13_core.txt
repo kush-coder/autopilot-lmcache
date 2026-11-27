@@ -5,4 +5,4 @@
 cupy-cuda13x
 # cuda.bindings, used by the timeline-semaphore event IPC backend
 # (selected under isolated IPC) and the raw CUDA IPC wrapper.
-cuda-python>=13,<14
+cuda-python>=13.4.4,<14
