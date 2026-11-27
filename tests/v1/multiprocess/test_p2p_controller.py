@@ -1,0 +1,739 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Tests for P2PController lookup jobs, locks, discovery and adapter lifecycle.
+"""
+
+# Standard
+from unittest.mock import MagicMock
+
+# Third Party
+import httpx
+import pytest
+import torch
+
+# First Party
+from lmcache.lmcache_native import Bitmap
+from lmcache.v1.common.transfer_channel.api import TransferChannelAddress
+from lmcache.v1.distributed.api import (
+    MemoryLayoutDesc,
+    MemoryResidency,
+    MemorySegment,
+    MemoryTags,
+    ObjectKey,
+    PrefetchResult,
+)
+from lmcache.v1.distributed.error import L1Error
+from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import P2PL2AdapterConfig
+from lmcache.v1.mp_observability.event import EventType
+from lmcache.v1.multiprocess.config import CoordinatorConfig, P2PConfig
+from lmcache.v1.multiprocess.modules import p2p_controller
+from lmcache.v1.multiprocess.modules.p2p_controller import (
+    _MAX_MISSES,
+    P2PController,
+    _P2PState,
+    _PeerInstance,
+)
+
+_INVALID = TransferChannelAddress(offset=-1, size=0)
+
+
+def _result(rows: list[Bitmap]) -> PrefetchResult:
+    """A finished prefetch whose hits all came from L1."""
+    return PrefetchResult(
+        hit_cells=rows,
+        l1_hit_cells=[row.copy() for row in rows],
+        l2_hit_cells=[Bitmap(len(row)) for row in rows],
+    )
+
+
+def _make_key(i: int, object_group_id: int = 0) -> ObjectKey:
+    return ObjectKey(
+        chunk_hash=f"hash{i}".encode(),
+        model_name="test_model",
+        kv_rank=1,
+        object_group_id=object_group_id,
+    )
+
+
+def _make_layout_desc() -> MemoryLayoutDesc:
+    return MemoryLayoutDesc(
+        shapes=[torch.Size([2, 3]), torch.Size([4])],
+        dtypes=[torch.float16, torch.bfloat16],
+    )
+
+
+# ============================================================================
+# TransferChannelAddress tests
+# ============================================================================
+
+
+def test_transfer_channel_address_validity():
+    """A non-negative offset is valid; a negative one is not."""
+    assert TransferChannelAddress(offset=128, size=64).is_valid()
+    assert not TransferChannelAddress(offset=-1, size=0).is_valid()
+
+
+# ============================================================================
+# Server handler tests
+# ============================================================================
+
+
+def _make_controller() -> tuple[P2PController, MagicMock]:
+    """Build a P2P-disabled controller (no thread / transfer channel)."""
+    ctx = MagicMock()
+    controller = P2PController(
+        ctx,
+        P2PConfig(),
+        CoordinatorConfig(),
+        instance_id="self",
+    )
+    return controller, ctx
+
+
+def test_lookup_and_lock_submits_l1_only_and_returns_task_id():
+    """p2p_lookup_and_lock submits a "full" (gap-tolerant) prefetch that
+    allows only the local DRAM L1 and no L2 adapter, with all keys in one
+    object-group row, and returns a fresh id."""
+    controller, ctx = _make_controller()
+    handle = MagicMock(total_requested_keys=2)
+    ctx.storage_manager.submit_prefetch_task.return_value = handle
+
+    keys = [_make_key(0), _make_key(1)]
+    layout = _make_layout_desc()
+    group_layout_descs = {0: layout}
+    task_id = controller.p2p_lookup_and_lock(keys, group_layout_descs)
+
+    assert task_id == 0
+    (spec,), _kwargs = ctx.storage_manager.submit_prefetch_task.call_args
+    assert [row.keys for row in spec.key_groups] == [keys]
+    assert [row.object_group_id for row in spec.key_groups] == [0]
+    assert spec.key_groups[0].layout_desc is layout
+    assert spec.allowed_l1_memory_tags == frozenset(
+        {MemoryTags(MemorySegment.DRAM, MemoryResidency.LOCAL)}
+    )
+    assert spec.allowed_l2_memory_tags == frozenset()
+    assert spec.fetching_policy == "full"
+    # A second call gets a distinct id.
+    assert controller.p2p_lookup_and_lock(keys, group_layout_descs) == 1
+
+
+def test_lookup_and_lock_groups_keys_per_object_group():
+    """Keys of several object groups become one row per group (first-seen
+    order, request order within a row), each with that group's layout."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.submit_prefetch_task.return_value = MagicMock(
+        total_requested_keys=1
+    )
+
+    layouts = {0: _make_layout_desc(), 1: _make_layout_desc()}
+    keys = [
+        _make_key(0, object_group_id=1),
+        _make_key(1, object_group_id=0),
+        _make_key(2, object_group_id=1),
+        _make_key(3, object_group_id=0),
+    ]
+    controller.p2p_lookup_and_lock(keys, layouts)
+
+    (spec,), _ = ctx.storage_manager.submit_prefetch_task.call_args
+    assert [row.object_group_id for row in spec.key_groups] == [1, 0]
+    assert spec.key_groups[0].keys == [keys[0], keys[2]]
+    assert spec.key_groups[1].keys == [keys[1], keys[3]]
+    assert spec.key_groups[0].layout_desc is layouts[1]
+    assert spec.key_groups[1].layout_desc is layouts[0]
+    assert spec.fetching_policy == "full"
+
+
+def test_lookup_and_lock_uneven_object_groups_report_misses():
+    """Object groups with different key counts cannot form a request: the
+    storage manager is never asked and every key resolves to a miss."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.query_prefetch_status.return_value = _result([Bitmap(0)])
+    layouts = {0: _make_layout_desc(), 1: _make_layout_desc()}
+    keys = [
+        _make_key(0, object_group_id=1),
+        _make_key(1, object_group_id=0),
+        _make_key(2, object_group_id=1),
+    ]
+    task_id = controller.p2p_lookup_and_lock(keys, layouts)
+    ctx.storage_manager.submit_prefetch_task.assert_not_called()
+    assert controller.p2p_query_lookup_results(task_id) == [_INVALID] * 3
+
+
+def test_lookup_and_lock_key_without_layout_reports_miss():
+    """A key whose object group has no layout never reaches the storage
+    manager and resolves to a miss."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.query_prefetch_status.return_value = _result([Bitmap(0)])
+    task_id = controller.p2p_lookup_and_lock(
+        [_make_key(0, object_group_id=3)], {0: _make_layout_desc()}
+    )
+    ctx.storage_manager.submit_prefetch_task.assert_not_called()
+    assert controller.p2p_query_lookup_results(task_id) == [_INVALID]
+
+
+def test_lookup_and_lock_empty_keys_completes_immediately():
+    """An empty key list never reaches the storage manager and resolves to an
+    empty address list."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.query_prefetch_status.return_value = _result([Bitmap(0)])
+
+    task_id = controller.p2p_lookup_and_lock([], {0: _make_layout_desc()})
+
+    ctx.storage_manager.submit_prefetch_task.assert_not_called()
+    assert controller.p2p_query_lookup_results(task_id) == []
+
+
+def test_query_lookup_results_builds_addresses_for_prefix():
+    """A completed lookup returns one address per key: real offsets for the
+    found prefix, invalid offsets for the rest."""
+    controller, ctx = _make_controller()
+    handle = MagicMock(total_requested_keys=2)
+    ctx.storage_manager.submit_prefetch_task.return_value = handle
+
+    keys = [_make_key(0), _make_key(1), _make_key(2)]
+    task_id = controller.p2p_lookup_and_lock(keys, {0: _make_layout_desc()})
+
+    ctx.storage_manager.query_prefetch_status.return_value = _result([Bitmap(3, 2)])
+    obj0 = MagicMock(shm_offset=100, shm_byte_length=10)
+    obj1 = MagicMock(shm_offset=200, shm_byte_length=20)
+    ctx.storage_manager.unsafe_read.return_value = ([keys[0], keys[1]], [obj0, obj1])
+
+    addresses = controller.p2p_query_lookup_results(task_id)
+    assert addresses == [
+        TransferChannelAddress(offset=100, size=10),
+        TransferChannelAddress(offset=200, size=20),
+        TransferChannelAddress(offset=-1, size=0),
+    ]
+
+
+def test_query_lookup_results_builds_addresses_for_sparse_hits():
+    """A lookup with a mid-sequence L1 gap returns real offsets at the found
+    indices and an invalid offset at the gap."""
+    controller, ctx = _make_controller()
+    handle = MagicMock(total_requested_keys=2)
+    ctx.storage_manager.submit_prefetch_task.return_value = handle
+
+    keys = [_make_key(0), _make_key(1), _make_key(2)]
+    task_id = controller.p2p_lookup_and_lock(keys, {0: _make_layout_desc()})
+
+    found = Bitmap(3)
+    found.batched_set([0, 2])
+    ctx.storage_manager.query_prefetch_status.return_value = _result([found])
+    obj0 = MagicMock(shm_offset=100, shm_byte_length=10)
+    obj2 = MagicMock(shm_offset=300, shm_byte_length=30)
+    ctx.storage_manager.unsafe_read.return_value = ([keys[0], keys[2]], [obj0, obj2])
+
+    addresses = controller.p2p_query_lookup_results(task_id)
+    ctx.storage_manager.unsafe_read.assert_called_once_with([keys[0], keys[2]])
+    assert addresses == [
+        TransferChannelAddress(offset=100, size=10),
+        TransferChannelAddress(offset=-1, size=0),
+        TransferChannelAddress(offset=300, size=30),
+    ]
+
+
+def test_query_lookup_results_multi_group_addresses_in_request_order():
+    """With several object-group rows, the per-row found bitmaps are mapped
+    back to the request order of the flat key list."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.submit_prefetch_task.return_value = MagicMock(
+        total_requested_keys=1
+    )
+    layouts = {0: _make_layout_desc(), 1: _make_layout_desc()}
+    keys = [
+        _make_key(0, object_group_id=1),  # row 0 (group 1), col 0
+        _make_key(1, object_group_id=0),  # row 1 (group 0), col 0
+        _make_key(2, object_group_id=1),  # row 0 (group 1), col 1
+        _make_key(3, object_group_id=0),  # row 1 (group 0), col 1
+    ]
+    task_id = controller.p2p_lookup_and_lock(keys, layouts)
+
+    row_g1 = Bitmap(2)
+    row_g1.set(1)  # keys[2] found
+    row_g0 = Bitmap(2, 1)  # keys[1] found
+    ctx.storage_manager.query_prefetch_status.return_value = _result([row_g1, row_g0])
+    obj1 = MagicMock(shm_offset=100, shm_byte_length=10)
+    obj2 = MagicMock(shm_offset=200, shm_byte_length=20)
+    ctx.storage_manager.unsafe_read.return_value = ([keys[2], keys[1]], [obj2, obj1])
+
+    addresses = controller.p2p_query_lookup_results(task_id)
+    ctx.storage_manager.unsafe_read.assert_called_once_with([keys[2], keys[1]])
+    assert addresses == [
+        TransferChannelAddress(offset=-1, size=0),
+        TransferChannelAddress(offset=100, size=10),
+        TransferChannelAddress(offset=200, size=20),
+        TransferChannelAddress(offset=-1, size=0),
+    ]
+
+
+def test_query_lookup_results_exactly_once():
+    """Re-querying a completed task returns None (the job is consumed)."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.submit_prefetch_task.return_value = MagicMock(
+        total_requested_keys=1
+    )
+    task_id = controller.p2p_lookup_and_lock([_make_key(0)], {0: _make_layout_desc()})
+
+    ctx.storage_manager.query_prefetch_status.return_value = _result([Bitmap(1)])
+
+    assert controller.p2p_query_lookup_results(task_id) == [
+        TransferChannelAddress(offset=-1, size=0)
+    ]
+    assert controller.p2p_query_lookup_results(task_id) is None
+
+
+def test_query_lookup_results_unknown_task():
+    """Querying an unknown task id returns None."""
+    controller, _ = _make_controller()
+    assert controller.p2p_query_lookup_results(999) is None
+
+
+def test_query_lookup_results_in_progress():
+    """A lookup whose prefetch is not done yet returns None without consuming
+    the job."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.submit_prefetch_task.return_value = MagicMock(
+        total_requested_keys=1
+    )
+    task_id = controller.p2p_lookup_and_lock([_make_key(0)], {0: _make_layout_desc()})
+
+    ctx.storage_manager.query_prefetch_status.return_value = None
+    assert controller.p2p_query_lookup_results(task_id) is None
+    # Job is still alive; status flips to done on the next poll.
+    ctx.storage_manager.query_prefetch_status.return_value = _result([Bitmap(1)])
+    assert controller.p2p_query_lookup_results(task_id) is not None
+
+
+class _FakeClock:
+    """Stand-in for the ``time`` module with a settable monotonic clock."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def test_abandoned_lookup_is_dropped_after_lookup_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A lookup nobody queries is dropped once the lookup timeout passes,
+    its prefetch result is drained, and its read locks are left to the TTL."""
+    clock = _FakeClock()
+    monkeypatch.setattr(p2p_controller, "time", clock)
+    controller, ctx = _make_controller()
+    ctx.storage_manager.submit_prefetch_task.return_value = MagicMock(
+        total_requested_keys=1
+    )
+    layouts = {0: _make_layout_desc()}
+    abandoned = controller.p2p_lookup_and_lock([_make_key(0)], layouts)
+
+    # Still within the timeout: a new lookup keeps the old job.
+    clock.now += P2PConfig().lookup_timeout - 1
+    controller.p2p_lookup_and_lock([_make_key(1)], layouts)
+    assert controller.report_status()["active_p2p_lookup_jobs"] == 2
+    ctx.storage_manager.query_prefetch_status.assert_not_called()
+
+    # Past the timeout: the next lookup drops the abandoned job only.
+    clock.now += 2
+    ctx.storage_manager.query_prefetch_status.return_value = _result([Bitmap(1)])
+    controller.p2p_lookup_and_lock([_make_key(2)], layouts)
+    assert controller.report_status()["active_p2p_lookup_jobs"] == 2
+    ctx.storage_manager.query_prefetch_status.assert_called_once()
+    ctx.storage_manager.finish_read_prefetched.assert_not_called()
+    assert controller.p2p_query_lookup_results(abandoned) is None
+
+
+def test_abandoned_lookup_still_running_is_kept(monkeypatch: pytest.MonkeyPatch):
+    """An expired lookup whose prefetch has not finished stays until a later
+    scan finds it finished; scans run at most once per lookup timeout."""
+    clock = _FakeClock()
+    monkeypatch.setattr(p2p_controller, "time", clock)
+    controller, ctx = _make_controller()
+    ctx.storage_manager.submit_prefetch_task.return_value = MagicMock(
+        total_requested_keys=1
+    )
+    timeout = P2PConfig().lookup_timeout
+    layouts = {0: _make_layout_desc()}
+    controller.p2p_lookup_and_lock([_make_key(0)], layouts)
+
+    # First scan: the expired job is still running, so it is kept.
+    clock.now += timeout + 1
+    ctx.storage_manager.query_prefetch_status.return_value = None
+    controller.p2p_lookup_and_lock([_make_key(1)], layouts)
+    assert controller.report_status()["active_p2p_lookup_jobs"] == 2
+
+    # Within one timeout of that scan, lookups do not scan again.
+    ctx.storage_manager.query_prefetch_status.reset_mock()
+    ctx.storage_manager.query_prefetch_status.return_value = _result([Bitmap(1)])
+    controller.p2p_lookup_and_lock([_make_key(2)], layouts)
+    assert controller.report_status()["active_p2p_lookup_jobs"] == 3
+    ctx.storage_manager.query_prefetch_status.assert_not_called()
+
+    # The next scan finds it finished and drops only that job.
+    clock.now += timeout
+    controller.p2p_lookup_and_lock([_make_key(3)], layouts)
+    assert controller.report_status()["active_p2p_lookup_jobs"] == 3
+    ctx.storage_manager.query_prefetch_status.assert_called_once()
+
+
+def test_unlock_objects_calls_finish_read_prefetched():
+    """p2p_unlock_objects forwards the keys to finish_read_prefetched."""
+    controller, ctx = _make_controller()
+    keys = [_make_key(0), _make_key(1)]
+    controller.p2p_unlock_objects(keys)
+    ctx.storage_manager.finish_read_prefetched.assert_called_once_with(keys)
+
+
+def test_unlock_objects_empty_is_noop():
+    """Unlocking an empty key list does nothing."""
+    controller, ctx = _make_controller()
+    controller.p2p_unlock_objects([])
+    ctx.storage_manager.finish_read_prefetched.assert_not_called()
+
+
+def _make_write_controller() -> tuple[P2PController, MagicMock, MagicMock]:
+    """Build a controller whose storage manager exposes a mock L1 to write."""
+    controller, ctx = _make_controller()
+    l1_manager = MagicMock()
+    ctx.storage_manager.get_l1_manager_by_tags.return_value = l1_manager
+    return controller, ctx, l1_manager
+
+
+def test_reserve_write_returns_one_address_per_key_in_request_order(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Reserved keys get their buffer's address; keys the L1 could not reserve
+    get an invalid one, and only the out-of-memory ones are reported."""
+    controller, ctx, l1_manager = _make_write_controller()
+    event_bus = MagicMock()
+    monkeypatch.setattr(p2p_controller, "get_event_bus", lambda: event_bus)
+    keys = [_make_key(0), _make_key(1), _make_key(2)]
+    layout = _make_layout_desc()
+    l1_manager.reserve_write.return_value = {
+        keys[0]: (L1Error.OUT_OF_MEMORY, None),
+        keys[1]: (
+            L1Error.SUCCESS,
+            MagicMock(shm_offset=8192, shm_byte_length=4096),
+        ),
+        keys[2]: (L1Error.KEY_NOT_WRITABLE, None),
+    }
+
+    addresses = controller.p2p_reserve_write(keys, layout)
+
+    assert addresses == [
+        _INVALID,
+        TransferChannelAddress(offset=8192, size=4096),
+        _INVALID,
+    ]
+    # Peers write into the L1 registered with the transfer channel, and the
+    # objects are ordinary (non-temporary) cache entries.
+    ctx.storage_manager.get_l1_manager_by_tags.assert_called_once_with(
+        MemoryTags(MemorySegment.DRAM, MemoryResidency.LOCAL)
+    )
+    reserve_call = l1_manager.reserve_write.call_args
+    assert reserve_call.args[0] == keys
+    assert reserve_call.kwargs["is_temporary"] == [False, False, False]
+    assert reserve_call.kwargs["layout_desc"] == layout
+
+    (event,) = [call.args[0] for call in event_bus.publish.call_args_list]
+    assert event.event_type == EventType.L1_ALLOCATION_FAILED
+    assert event.metadata == {"during": "p2p_store", "keys": [keys[0]]}
+
+
+def test_finish_write_commits_written_keys_and_discards_the_rest():
+    """Each key gets one flag: True only when it was written and committed."""
+    controller, _ctx, l1_manager = _make_write_controller()
+    keys = [_make_key(0), _make_key(1), _make_key(2)]
+    l1_manager.reserve_write.return_value = {
+        key: (L1Error.SUCCESS, MagicMock(shm_offset=0, shm_byte_length=4096))
+        for key in keys
+    }
+    controller.p2p_reserve_write(keys, _make_layout_desc())
+    writer_tag = l1_manager.reserve_write.call_args.kwargs["tag"]
+    # keys[2] was written, but its reservation expired before the commit.
+    l1_manager.finish_write.return_value = {
+        keys[0]: L1Error.SUCCESS,
+        keys[2]: L1Error.KEY_NOT_EXIST,
+    }
+
+    committed = controller.p2p_finish_write(keys, [True, False, True])
+
+    assert committed == [True, False, False]
+    # Commit and discard address the reservations made by the same writer.
+    l1_manager.finish_write.assert_called_once_with([keys[0], keys[2]], tag=writer_tag)
+    l1_manager.finish_write_and_delete.assert_called_once_with(
+        [keys[1]], tag=writer_tag
+    )
+
+
+def test_finish_write_rejects_mismatched_lengths():
+    controller, _ctx, _l1_manager = _make_write_controller()
+    with pytest.raises(ValueError):
+        controller.p2p_finish_write([_make_key(0), _make_key(1)], [True])
+
+
+def test_report_status_counts_active_jobs():
+    """report_status reflects the number of in-flight lookup jobs."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.submit_prefetch_task.return_value = MagicMock(
+        total_requested_keys=1
+    )
+    assert controller.report_status()["active_p2p_lookup_jobs"] == 0
+    controller.p2p_lookup_and_lock([_make_key(0)], {0: _make_layout_desc()})
+    status = controller.report_status()
+    assert status["active_p2p_lookup_jobs"] == 1
+    assert status["p2p_enabled"] is False
+    assert status["p2p_state"] == _P2PState.UNREGISTERED.value
+
+
+# ============================================================================
+# Orchestration: adapter reconcile
+# ============================================================================
+
+
+def _peer(
+    instance_id: str,
+    url: str = "tc-host:9",
+    ip: str = "10.0.0.2",
+    mq_port: int = 5555,
+) -> _PeerInstance:
+    return _PeerInstance(
+        instance_id=instance_id,
+        ip=ip,
+        p2p_advertised_url=url,
+        mq_port=mq_port,
+    )
+
+
+def test_reconcile_adds_new_peer() -> None:
+    """A newly discovered peer gets one P2P L2 adapter with the right urls."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.add_l2_adapter.return_value = 7
+
+    controller._apply_state(_P2PState.REGISTERED, {"peerA": _peer("peerA")})
+
+    ctx.storage_manager.add_l2_adapter.assert_called_once()
+    config = ctx.storage_manager.add_l2_adapter.call_args.args[0]
+    assert isinstance(config, P2PL2AdapterConfig)
+    assert config.peer_mq_server_url == "grpc://10.0.0.2:5555"
+    assert config.peer_transfer_channel_server_url == "tc-host:9"
+    assert controller.report_status()["p2p_peers"] == ["peerA"]
+
+
+def test_new_peer_adapter_follows_the_p2p_write_settings():
+    """The adapter created for a peer carries this server's write settings."""
+    ctx = MagicMock()
+    controller = P2PController(
+        ctx,
+        P2PConfig(enable_write=True, store_timeout=12.0, write_l1_usage_threshold=0.5),
+        CoordinatorConfig(),
+        instance_id="self",
+    )
+
+    controller._apply_state(_P2PState.REGISTERED, {"peerA": _peer("peerA")})
+
+    config = ctx.storage_manager.add_l2_adapter.call_args.args[0]
+    assert config.write_enabled is True
+    assert config.store_timeout_s == 12.0
+    assert config.write_l1_usage_threshold == 0.5
+
+
+def test_peer_adapter_does_not_write_by_default():
+    controller, ctx = _make_controller()
+
+    controller._apply_state(_P2PState.REGISTERED, {"peerA": _peer("peerA")})
+
+    config = ctx.storage_manager.add_l2_adapter.call_args.args[0]
+    assert config.write_enabled is False
+
+
+@pytest.mark.parametrize(
+    ("store_timeout", "threshold"),
+    [
+        pytest.param(0.0, 0.7, id="non-positive-timeout"),
+        pytest.param(30.0, 0.0, id="zero-threshold"),
+        pytest.param(30.0, 1.5, id="threshold-above-one"),
+    ],
+)
+def test_p2p_config_rejects_invalid_write_settings(
+    store_timeout: float, threshold: float
+):
+    with pytest.raises(ValueError):
+        P2PConfig(store_timeout=store_timeout, write_l1_usage_threshold=threshold)
+
+
+def test_reconcile_no_op_when_peer_unchanged():
+    """A still-present, unchanged peer is not re-added on the next cycle."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.add_l2_adapter.return_value = 7
+
+    controller._apply_state(_P2PState.REGISTERED, {"peerA": _peer("peerA")})
+    controller._apply_state(_P2PState.REGISTERED, {"peerA": _peer("peerA")})
+
+    ctx.storage_manager.add_l2_adapter.assert_called_once()
+    ctx.storage_manager.delete_l2_adapter.assert_not_called()
+
+
+def test_reconcile_keeps_peer_within_grace():
+    """A peer absent for up to _MAX_MISSES cycles keeps its adapter."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.add_l2_adapter.return_value = 7
+
+    controller._apply_state(_P2PState.REGISTERED, {"peerA": _peer("peerA")})
+    for _ in range(_MAX_MISSES):
+        controller._apply_state(_P2PState.REGISTERED, {})
+
+    ctx.storage_manager.delete_l2_adapter.assert_not_called()
+    assert controller.report_status()["p2p_peers"] == ["peerA"]
+
+
+def test_reconcile_removes_peer_after_grace():
+    """A peer absent beyond _MAX_MISSES cycles has its adapter removed."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.add_l2_adapter.return_value = 7
+
+    controller._apply_state(_P2PState.REGISTERED, {"peerA": _peer("peerA")})
+    for _ in range(_MAX_MISSES + 1):
+        controller._apply_state(_P2PState.REGISTERED, {})
+
+    ctx.storage_manager.delete_l2_adapter.assert_called_once_with(7)
+    assert controller.report_status()["p2p_peers"] == []
+
+
+def test_reconcile_readds_on_url_change():
+    """A peer whose advertised url changes is removed and re-added."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.add_l2_adapter.side_effect = [7, 8]
+
+    controller._apply_state(_P2PState.REGISTERED, {"peerA": _peer("peerA", url="a:1")})
+    controller._apply_state(_P2PState.REGISTERED, {"peerA": _peer("peerA", url="b:2")})
+
+    ctx.storage_manager.delete_l2_adapter.assert_called_once_with(7)
+    assert ctx.storage_manager.add_l2_adapter.call_count == 2
+    latest = ctx.storage_manager.add_l2_adapter.call_args.args[0]
+    assert latest.peer_transfer_channel_server_url == "b:2"
+
+
+def test_close_removes_all_adapters():
+    """close drains every tracked peer adapter."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.add_l2_adapter.side_effect = [7, 8]
+    controller._apply_state(
+        _P2PState.REGISTERED,
+        {"peerA": _peer("peerA"), "peerB": _peer("peerB", mq_port=5556)},
+    )
+
+    controller.close()
+
+    removed = {c.args[0] for c in ctx.storage_manager.delete_l2_adapter.call_args_list}
+    assert removed == {7, 8}
+
+
+# ============================================================================
+# Orchestration: poll-cycle state machine
+# ============================================================================
+
+
+def _enable_polling(
+    controller: P2PController, advertise_url: str = "me:1"
+) -> MagicMock:
+    """Point a controller's poll loop at a mock coordinator client."""
+    controller._p2p_config = P2PConfig(advertise_url=advertise_url)
+    controller._instances_url = "http://coordinator/instances"
+    client = MagicMock()
+    controller._http_client = client
+    return client
+
+
+def _instances_response(instances: list[dict]) -> MagicMock:
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"instances": instances}
+    return response
+
+
+def _entry(
+    instance_id: str,
+    url: str,
+    ip: str = "10.0.0.9",
+    mq_port: int = 5555,
+) -> dict:
+    return {
+        "instance_id": instance_id,
+        "ip": ip,
+        "p2p_advertised_url": url,
+        "mq_port": mq_port,
+    }
+
+
+def test_poll_cycle_timeout_is_disconnected():
+    """A request timeout maps to the Disconnected state."""
+    controller, _ = _make_controller()
+    client = _enable_polling(controller)
+    client.get.side_effect = httpx.TimeoutException("boom")
+
+    controller._poll_cycle()
+    assert controller.report_status()["p2p_state"] == _P2PState.DISCONNECTED.value
+
+
+def test_poll_cycle_http_error_is_unregistered():
+    """A non-timeout HTTP error maps to the Unregistered state."""
+    controller, _ = _make_controller()
+    client = _enable_polling(controller)
+    client.get.side_effect = httpx.HTTPError("boom")
+
+    controller._poll_cycle()
+    assert controller.report_status()["p2p_state"] == _P2PState.UNREGISTERED.value
+
+
+def test_poll_cycle_self_absent_is_unregistered():
+    """Not finding our own instance in the listing is Unregistered."""
+    controller, _ = _make_controller()
+    client = _enable_polling(controller)
+    client.get.return_value = _instances_response([_entry("other", "tc:1")])
+
+    controller._poll_cycle()
+    assert controller.report_status()["p2p_state"] == _P2PState.UNREGISTERED.value
+
+
+def test_poll_cycle_registered_excludes_self_and_adds_peer():
+    """When registered, peers (but not self) get adapters."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.add_l2_adapter.return_value = 7
+    client = _enable_polling(controller, advertise_url="me:1")
+    client.get.return_value = _instances_response(
+        [_entry("self", "me:1"), _entry("peerA", "tc:1")]
+    )
+
+    controller._poll_cycle()
+
+    status = controller.report_status()
+    assert status["p2p_state"] == _P2PState.REGISTERED.value
+    assert status["p2p_peers"] == ["peerA"]
+
+
+def test_poll_cycle_unexpected_error_does_not_crash():
+    """An unexpected parsing error is caught and maps to Unregistered."""
+    controller, _ = _make_controller()
+    client = _enable_polling(controller)
+    # A non-dict entry makes parsing raise AttributeError (raw.get on a str).
+    client.get.return_value = _instances_response(["not-a-dict"])
+
+    summary = controller._poll_cycle()  # must not raise
+    assert summary.success is True
+    assert controller.report_status()["p2p_state"] == _P2PState.UNREGISTERED.value
+
+
+def test_poll_cycle_skips_peer_without_p2p_url():
+    """A peer that advertises no p2p url is not adapted."""
+    controller, ctx = _make_controller()
+    client = _enable_polling(controller, advertise_url="me:1")
+    client.get.return_value = _instances_response(
+        [_entry("self", "me:1"), _entry("peerA", "")]
+    )
+
+    controller._poll_cycle()
+
+    ctx.storage_manager.add_l2_adapter.assert_not_called()
+    assert controller.report_status()["p2p_peers"] == []

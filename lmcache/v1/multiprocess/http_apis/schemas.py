@@ -1,0 +1,108 @@
+# SPDX-License-Identifier: Apache-2.0
+"""HTTP wire models for the MP server's ``/cache/*`` endpoints.
+
+These describe request bodies only -- the HTTP boundary. FastAPI validates them
+(field types -> 422) before a handler runs; semantic validation and responses
+belong to the ``cache_control`` services. ``Tier`` is imported from the domain
+(it is cache vocabulary, not an HTTP type).
+"""
+
+# Standard
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+
+# First Party
+from lmcache.v1.distributed.api import EncodedObjectKey, Tier, validate_identity_tags
+from lmcache.v1.multiprocess.cache_control.key_resolver import MAX_KEYS_PER_REQUEST
+from lmcache.v1.utils.frozen_dict import freeze_dict
+
+
+@dataclass(frozen=True)
+class DeleteObjectsRequest:
+    """Wire body for ``DELETE /cache/objects``.
+
+    Key-addressed delete for L1, L2, or both. ``keys`` field types are validated
+    by FastAPI (422); their ``ObjectKey`` invariants and the batch cap are
+    enforced by the service. ``tier`` selects the tier(s) -- ``l1`` / ``l2`` /
+    ``all`` (default ``l2`` for backward compatibility with the eviction loop).
+    ``force`` deletes L1 keys even if read/write-locked. ``adapter`` selects an
+    L2 adapter, else the primary (ignored when ``tier`` is ``l1``).
+    """
+
+    keys: list[EncodedObjectKey]
+    tier: Tier = Tier.L2
+    force: bool = False
+    adapter: str | None = None
+
+
+@dataclass(frozen=True)
+class PrefetchRequest:
+    """Wire body for ``POST /cache/prefetches``.
+
+    Supply exactly one form. ``token_ids`` (with ``model_name`` /
+    ``world_size``): the server resolves the per-rank keys of the sequence's
+    whole chunks itself. ``keys``: each key names a chunk, which is warmed in
+    every object group and rank; this reaches a chunk in the middle of a
+    prompt without its prefix chunks. ``source_tier`` / ``target_tier`` are
+    request data (today only ``l2`` -> ``l1``).
+
+    Raises:
+        ValueError: both or neither of ``keys`` / ``token_ids`` is supplied,
+            ``token_ids`` comes without ``model_name`` or a ``world_size`` of
+            at least 1, there are more than ``MAX_KEYS_PER_REQUEST`` keys, a
+            key cannot convert into an ``ObjectKey``, or a tag is invalid
+            (surfaced as 422).
+    """
+
+    model_name: str = ""
+    world_size: int = 0
+    token_ids: list[int] = field(default_factory=list)
+    cache_salt: str = ""
+    source_tier: Tier = Tier.L2
+    target_tier: Tier = Tier.L1
+    tags: Mapping[str, str] = field(default_factory=dict)
+    keys: list[EncodedObjectKey] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if bool(self.keys) == bool(self.token_ids):
+            raise ValueError("supply exactly one of 'keys' or 'token_ids'")
+        if self.token_ids and not self.model_name:
+            raise ValueError("'model_name' is required with 'token_ids'")
+        if self.token_ids and self.world_size < 1:
+            raise ValueError("'world_size' (>= 1) is required with 'token_ids'")
+        if len(self.keys) > MAX_KEYS_PER_REQUEST:
+            raise ValueError(
+                f"too many keys in a single request "
+                f"(limit={MAX_KEYS_PER_REQUEST}, got={len(self.keys)})"
+            )
+        for encoded in self.keys:
+            encoded.to_object_key()
+        validate_identity_tags(self.tags)
+        object.__setattr__(self, "tags", freeze_dict(self.tags, sort_keys=True))
+
+
+@dataclass(frozen=True)
+class ClearRequest:
+    """Wire body for ``POST /cache/clear``.
+
+    ``tier`` is request data (today only ``l1``). ``force=true`` means active
+    locks may be ignored if the implementation supports forced cleanup.
+    """
+
+    tier: Tier = Tier.L1
+    force: bool = False
+
+
+@dataclass(frozen=True)
+class ChecksumRequest:
+    """Wire body for ``POST /cache/checksums``.
+
+    ``block_ids`` are the target GPU block IDs; ``chunk_size`` blocks are hashed
+    per chunk. ``instance_id`` selects the GPU context; ``layerwise`` returns
+    per-layer digests.
+    """
+
+    block_ids: list[int] = field(default_factory=list)
+    chunk_size: int = 0
+    instance_id: int = 0
+    layerwise: bool = False

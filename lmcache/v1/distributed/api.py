@@ -1,0 +1,1048 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Defines the data structures that will be used by the
+distributed storage manager public functions
+
+Could be implemented by native code in the future
+"""
+
+# Standard
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Literal, get_args
+import enum
+
+# First Party
+from lmcache.v1.common.api import MemoryLayoutDesc as MemoryLayoutDesc
+from lmcache.v1.common.attn_window import AttnWindowDesc
+from lmcache.v1.common.logging import init_logger
+from lmcache.v1.utils.frozen_dict import freeze_dict
+
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.lmcache_native import Bitmap
+    from lmcache.v1.common.custom_types import IPCCacheServerKey
+
+logger = init_logger(__name__)
+
+_OBJECT_KEY_HASH_ATTR = "_hash_value"
+"""Instance attribute holding an ``ObjectKey``'s hash once computed."""
+
+CHUNK_SIZE_TAG = "chunk_size"
+"""Identity tag containing an object's effective full chunk size."""
+
+FetchingPolicy = Literal["prefix", "full", "whole_chunk"]
+"""Which found objects a prefetch loads and reports.
+
+``"prefix"`` -- only fetch the prefix hit and discard all non-prefix hits.
+
+``"full"`` -- fetch all of the hit chunks, no matter whether they are in the
+prefix or not. Key groups are independent: a chunk found in one key group is
+fetched even when another key group misses it.
+
+``"whole_chunk"`` -- like ``"full"``, but fetch a chunk only when every key
+group holds it. For callers that need all key groups of a chunk at once (a
+blended chunk): a chunk some key group misses, or cannot stage in L1, is
+dropped before it costs an L2 read.
+"""
+
+FULL_ATTENTION_WINDOW_CHUNKS = -1
+"""``GroupedObjectKeys.sliding_window_size`` value for a full-attention object
+group: serving a prefix needs every chunk of it present."""
+
+_VALID_FETCHING_POLICIES = frozenset(get_args(FetchingPolicy))
+
+
+def get_kv_worker_ids(world_size: int, tp_replicas: int, dcp_shards: int) -> list[int]:
+    """Return the worker IDs that key a group's distinct KV shards.
+
+    Args:
+        world_size: Number of workers in the KV world.
+        tp_replicas: Consecutive workers sharing the group; must be positive.
+        dcp_shards: Distinct token shards within each replicated group.
+
+    Returns:
+        The first worker holding each shard, in rank order. With no replication
+        (``tp_replicas == dcp_shards == 1``), every worker keys its own object.
+    """
+    return [
+        first + shard
+        for first in range(0, world_size, tp_replicas)
+        for shard in range(dcp_shards)
+    ]
+
+
+def _lookup_kv_ranks(
+    ipc_key: "IPCCacheServerKey", tp_replicas: int, dcp_shards: int
+) -> list[int]:
+    """The kv ranks an IPC key addresses, in rank order.
+
+    A key without a ``worker_id`` (a lookup) fans out to every worker of its
+    world size; a worker-specific key addresses that worker's shard only.
+    ``tp_replicas`` consecutive workers hold the same group, split into
+    ``dcp_shards`` token shards: worker ``w`` holds shard ``w % dcp_shards``.
+    Each shard is keyed by the first of those consecutive workers that holds
+    it, so a lookup addresses ``dcp_shards`` ranks per ``tp_replicas``
+    workers and a worker key the rank of its own shard. ``(1, 1)`` is the
+    per-rank layout.
+    """
+    if ipc_key.worker_id is None:
+        # For look up request, we want to expand to all workers
+        # TODO (ApostaC): include local world size/rank info
+        # in the future once it's in IPCCacheServerKey
+        worker_ids = get_kv_worker_ids(ipc_key.world_size, tp_replicas, dcp_shards)
+    else:
+        w = ipc_key.worker_id
+        worker_ids = [w - w % tp_replicas + w % dcp_shards]
+    return [
+        ObjectKey.ComputeKVRank(
+            world_size=ipc_key.world_size,
+            global_rank=worker_id,
+            local_world_size=ipc_key.world_size,
+            local_rank=worker_id,
+        )
+        for worker_id in worker_ids
+    ]
+
+
+class Tier(str, enum.Enum):
+    """A cache tier.
+
+    Subclasses ``str`` so it validates from / compares equal to the bare wire
+    value (``Tier.L2 == "l2"``) and serializes as that value. ``ALL`` is only
+    valid for operations that explicitly support multiple tiers.
+    """
+
+    L1 = "l1"
+    L2 = "l2"
+    ALL = "all"
+
+
+class L1BackendType(str, enum.Enum):
+    """The storage medium backing the L1 tier (a closed set, unlike L2
+    backends, which are an open adapter-type registry).
+
+    Subclasses ``str`` so it compares equal to and serializes as the bare
+    wire value (``L1BackendType.DRAM == "dram"``).
+    """
+
+    DRAM = "dram"
+    DEVDAX = "devdax"
+    GDS = "gds"
+
+
+class MemorySegment(str, enum.Enum):
+    """The kind of memory or storage that holds an L1's or L2's bytes.
+
+    Note:
+        Only for prefetch target filtering and L1-L2 affinity. Any other
+        use needs agreement from @ApostaC first.
+    """
+
+    VRAM = "vram"
+    """GPU memory. Reserved for GDS/GDR L2 adapters; nothing reports it yet."""
+
+    DRAM = "dram"
+    """Host CPU memory."""
+
+    CXL = "cxl"
+    """CXL memory mapped through Device-DAX."""
+
+    GDS = "gds"
+    """NVMe storage accessed through GPUDirect Storage."""
+
+    STORAGE = "storage"
+    """Any other storage medium."""
+
+
+class MemoryResidency(str, enum.Enum):
+    """Where the bytes of an L1 or L2 reside relative to this host.
+
+    Note:
+        Only for prefetch target filtering and L1-L2 affinity. Any other
+        use needs agreement from @ApostaC first.
+    """
+
+    LOCAL = "local"
+    """The bytes reside on this host."""
+
+    REMOTE = "remote"
+    """The bytes reside elsewhere, or in a domain shared with other hosts."""
+
+    SHADOW = "shadow"
+    """The bytes reside elsewhere, owned by a remote host and leased by the
+    local host. Unlike LOCAL and REMOTE, the objects carry no tensor: readers
+    read the bytes into a device region of their own."""
+
+
+@dataclass(frozen=True)
+class MemoryTags:
+    """The intrinsic memory properties of an L1 manager or an L2 adapter.
+
+    Note:
+        Only for prefetch target filtering and L1-L2 affinity. Any other
+        use needs agreement from @ApostaC first. Tags are compared by exact
+        equality.
+    """
+
+    segment: MemorySegment
+    """The kind of memory or storage that holds the bytes."""
+
+    residency: MemoryResidency
+    """Where the bytes reside relative to this host."""
+
+
+def validate_identity_tags(tags: Mapping[str, str]) -> None:
+    """Validate identity tag names and values."""
+    for name, value in tags.items():
+        if not isinstance(name, str) or not name or not isinstance(value, str):
+            raise ValueError("tags require non-empty string names and string values")
+
+
+def get_request_tags(
+    request_configs: Mapping[str, object] | None,
+) -> Mapping[str, str]:
+    """Extract and canonicalize matching tags from request configuration.
+
+    Args:
+        request_configs: Request metadata whose ``lmcache.tag.*`` entries
+            define matching dimensions.
+
+    Returns:
+        An immutable mapping with the prefix removed and names sorted.
+
+    Raises:
+        ValueError: A matching tag name is empty, reserved for internal use,
+            or its value is not a string.
+    """
+    tags: dict[str, str] = {}
+    for name, value in (request_configs or {}).items():
+        if not name.startswith("lmcache.tag."):
+            continue
+        if not isinstance(value, str):
+            raise ValueError("tags require non-empty string names and string values")
+        tag_name = name.removeprefix("lmcache.tag.")
+        if tag_name == CHUNK_SIZE_TAG:
+            raise ValueError(
+                f"lmcache.tag.{CHUNK_SIZE_TAG} is reserved for internal use"
+            )
+        tags[tag_name] = value
+    validate_identity_tags(tags)
+    return freeze_dict(tags, sort_keys=True)
+
+
+def _get_object_identity_tags(
+    request_configs: Mapping[str, object] | None,
+    chunk_size: int | None,
+) -> Mapping[str, str]:
+    """Return request tags plus the internal unfull-chunk namespace."""
+    tags = get_request_tags(request_configs)
+    if chunk_size is None:
+        return tags
+    return freeze_dict({**tags, CHUNK_SIZE_TAG: str(chunk_size)}, sort_keys=True)
+
+
+@dataclass(frozen=True)
+class ObjectKeyIdentity:
+    """Matching fields shared by local objects and internal wire messages."""
+
+    chunk_hash: bytes
+    kv_rank: int
+    model_name: str
+    object_group_id: int = 0
+    cache_salt: str = ""
+    tags: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if "@" in self.model_name:
+            raise ValueError("model_name must not contain '@'")
+        if self.object_group_id < 0:
+            raise ValueError("object_group_id must be >= 0")
+        if any(char in self.cache_salt for char in "@/\\\x00"):
+            raise ValueError("cache_salt must not contain '@', '/', '\\' or NUL")
+        if len(self.cache_salt) > 128:
+            raise ValueError("cache_salt exceeds max length 128")
+        validate_identity_tags(self.tags)
+        object.__setattr__(self, "tags", freeze_dict(self.tags, sort_keys=True))
+
+
+@dataclass(frozen=True, init=False)
+class ObjectKey:
+    """
+    The unique identifier for an object in the distributed storage manager
+    """
+
+    identity: ObjectKeyIdentity
+
+    extra_attributes: dict[str, object] = field(
+        default_factory=dict, compare=False, repr=False
+    )
+    """Request-scoped metadata exposed to L2 adapters.
+
+    This field is excluded from equality, hashing, and ``repr``.
+    Upstream modules may enrich it before dispatch.
+    L1 managers and L2 adapters should not mutate it.
+    """
+
+    def __init__(
+        self,
+        chunk_hash: bytes | None = None,
+        model_name: str | None = None,
+        kv_rank: int | None = None,
+        object_group_id: int | None = None,
+        cache_salt: str | None = None,
+        *,
+        identity: ObjectKeyIdentity | None = None,
+        extra_attributes: dict[str, object] | None = None,
+        tags: Mapping[str, str] | None = None,
+    ) -> None:
+        """Build a key from its identity or the existing flat constructor.
+
+        Explicit flat fields override the supplied identity. This also retains
+        ``dataclasses.replace(key, object_group_id=...)`` and other flat field
+        replacements used by existing consumers.
+
+        Args:
+            chunk_hash: Content hash; required without ``identity``.
+            model_name: Model name; required without ``identity``.
+            kv_rank: Packed KV rank; required without ``identity``.
+            object_group_id: Object group; defaults to 0 without an identity.
+            cache_salt: Isolation salt; defaults to empty without an identity.
+            identity: Immutable identity providing fields not supplied explicitly.
+            extra_attributes: Request-scoped metadata exposed to L2 adapters,
+                shallow-copied so the key can be enriched independently.
+            tags: Additional matching dimensions for the flat constructor.
+
+        Raises:
+            TypeError: A required flat field is missing without ``identity``.
+            ValueError: An identity field violates its invariant.
+        """
+        if identity is None:
+            if chunk_hash is None or model_name is None or kv_rank is None:
+                raise TypeError("chunk_hash, model_name and kv_rank are required")
+            identity = ObjectKeyIdentity(
+                chunk_hash=chunk_hash,
+                model_name=model_name,
+                kv_rank=kv_rank,
+                object_group_id=object_group_id if object_group_id is not None else 0,
+                cache_salt=cache_salt if cache_salt is not None else "",
+                tags=tags if tags is not None else {},
+            )
+        elif (
+            chunk_hash is not None
+            or model_name is not None
+            or kv_rank is not None
+            or object_group_id is not None
+            or cache_salt is not None
+            or tags is not None
+        ):
+            identity = replace(
+                identity,
+                chunk_hash=chunk_hash
+                if chunk_hash is not None
+                else identity.chunk_hash,
+                model_name=model_name
+                if model_name is not None
+                else identity.model_name,
+                kv_rank=kv_rank if kv_rank is not None else identity.kv_rank,
+                object_group_id=(
+                    object_group_id
+                    if object_group_id is not None
+                    else identity.object_group_id
+                ),
+                cache_salt=cache_salt
+                if cache_salt is not None
+                else identity.cache_salt,
+                tags=tags if tags is not None else identity.tags,
+            )
+        object.__setattr__(self, "identity", identity)
+        object.__setattr__(
+            self,
+            "extra_attributes",
+            dict(extra_attributes) if extra_attributes is not None else {},
+        )
+
+    def __hash__(self) -> int:
+        """Hash the identity, computing it at most once per object.
+
+        Returns:
+            The hash of ``identity``; ``extra_attributes`` never contributes.
+
+        Note:
+            The value is kept as a non-field instance attribute, so it stays
+            out of ``repr``, equality, ``dataclasses.fields`` and msgspec
+            encoding. It is set lazily because msgspec decoding bypasses
+            ``__init__``.
+        """
+        # A miss is the common first call, so avoid raising KeyError for it.
+        value = self.__dict__.get(_OBJECT_KEY_HASH_ATTR)
+        if value is None:
+            value = hash(self.identity)
+            self.__dict__[_OBJECT_KEY_HASH_ATTR] = value
+        return value
+
+    def __getstate__(self) -> dict[str, object]:
+        """Return the pickling and copying state without the kept hash.
+
+        Returns:
+            The instance attributes except the kept hash value.
+
+        Note:
+            ``str`` and ``bytes`` hashes differ between processes, so a kept
+            hash must never travel with a pickled key.
+        """
+        state = dict(self.__dict__)
+        state.pop(_OBJECT_KEY_HASH_ATTR, None)
+        return state
+
+    @property
+    def chunk_hash(self) -> bytes:
+        """Read chunk_hash from the identity."""
+        return self.identity.chunk_hash
+
+    @property
+    def model_name(self) -> str:
+        """Read model_name from the identity."""
+        return self.identity.model_name
+
+    @property
+    def cache_salt(self) -> str:
+        """Read cache_salt from the identity."""
+        return self.identity.cache_salt
+
+    @property
+    def kv_rank(self) -> int:
+        """Read kv_rank from the identity."""
+        return self.identity.kv_rank
+
+    @property
+    def object_group_id(self) -> int:
+        """Read object_group_id from the identity."""
+        return self.identity.object_group_id
+
+    def to_encoded_object_key(self) -> "EncodedObjectKey":
+        """Return the JSON-safe :class:`EncodedObjectKey` projection."""
+        return EncodedObjectKey(
+            chunk_hash_hex=self.chunk_hash.hex(),
+            model_name=self.model_name,
+            kv_rank=self.kv_rank,
+            object_group_id=self.object_group_id,
+            cache_salt=self.cache_salt,
+            tags=self.identity.tags,
+        )
+
+    @staticmethod
+    def IntHash2Bytes(chunk_hash: int) -> bytes:
+        # NOTE: this is only used by tests
+        return chunk_hash.to_bytes(4, byteorder="big")
+
+    @staticmethod
+    def Bytes2IntHash(chunk_hash: bytes) -> int:
+        # NOTE: this is only used by tests
+        return int.from_bytes(chunk_hash, byteorder="big") & ((1 << 64) - 1)
+
+    @staticmethod
+    def ComputeKVRank(
+        world_size: int,
+        global_rank: int,
+        local_world_size: int,
+        local_rank: int,
+    ) -> int:
+        """
+        Compute the kv_rank from world_size and worker_id
+
+        Args:
+            world_size (int): The total number of workers (include TP + PP)
+            global_rank (int): The global worker id (from 0 to world_size - 1)
+            local_world_size (int): The local world size (for local node),
+                should NOT be greater than 8
+            local_rank (int): The local world rank (for local node)
+
+        Returns:
+            The special KV rank (bitmap) used by the objectkey
+
+        Example:
+            In the case of TP=4, PP=2, the TP worker 1 on node 1 has:
+            - world_size = 8
+            - global_rank = 5
+            - local_world_size = 4
+            - local_rank = 1
+
+            The output KV rank is the bitmap:
+            +--head--+
+            |00000000|
+            |00000000|
+            |00000000|
+            |00000000| layers
+            |00001100|
+            |00001100|
+            |00001100|
+            |00001100|
+            +--------+
+        """
+        # TODO(ApostaC): in the long run, we want to have the above bitmap based
+        # representation for asymmetric parallelism (e.g., sharing across different
+        # TP/PP settings).
+        # For now, let's have a simple implementation that just
+        # differentiate between different parallel setups
+
+        # For each number, we use 8-bit, and pack them together
+        return (
+            (world_size << 24)
+            | (global_rank << 16)
+            | (local_world_size << 8)
+            | local_rank
+        )
+
+    @staticmethod
+    def WorldSizeFromKVRank(kv_rank: int) -> int:
+        """Recover the world size :meth:`ComputeKVRank` packed into a rank.
+
+        Args:
+            kv_rank: A ``kv_rank`` produced by :meth:`ComputeKVRank`.
+
+        Returns:
+            The parallel setup's world size (TP x PP).
+        """
+        return (kv_rank >> 24) & 0xFF
+
+
+@dataclass(frozen=True)
+class EncodedObjectKey:
+    """JSON-safe wire form of :class:`ObjectKey` — ``chunk_hash`` is
+    hex-encoded; other fields are preserved verbatim."""
+
+    chunk_hash_hex: str
+    """Hex-encoded ``ObjectKey.chunk_hash``."""
+
+    model_name: str
+    kv_rank: int
+
+    object_group_id: int = 0
+    """Defaults to ``0`` so pre-``object_group_id`` wire payloads still
+    deserialize."""
+
+    cache_salt: str = ""
+    tags: Mapping[str, str] = field(default_factory=dict)
+    """Canonical matching tags that participate in object identity."""
+
+    def __post_init__(self) -> None:
+        validate_identity_tags(self.tags)
+        object.__setattr__(self, "tags", freeze_dict(self.tags, sort_keys=True))
+
+    def to_object_key(self) -> ObjectKey:
+        """Recover the corresponding :class:`ObjectKey`.
+
+        Raises:
+            ValueError: ``chunk_hash_hex`` is not valid hex, or one of
+                :class:`ObjectKey`'s field invariants is violated.
+        """
+        return ObjectKey(
+            chunk_hash=bytes.fromhex(self.chunk_hash_hex),
+            model_name=self.model_name,
+            kv_rank=self.kv_rank,
+            object_group_id=self.object_group_id,
+            cache_salt=self.cache_salt,
+            tags=self.tags,
+        )
+
+
+@dataclass(frozen=True)
+class ModuleMemoryCapacity:
+    """One compartment's declared capacity: an L1 medium or an L2 adapter.
+
+    Keyed on the same ``(tier, backend)`` axis cache events use.
+
+    Attributes:
+        tier: ``Tier.L1`` or ``Tier.L2``.
+        backend: Medium within the tier (``"dram"``, ``"devdax"``,
+            ``"gds"``, or an L2 adapter type such as ``"s3"``).
+        capacity_bytes: Declared usable capacity. ``0`` means undeclared --
+            reported as unknown, not as full.
+        shared: Set when instances mount this pool, so its capacity must
+            not be summed across them.
+    """
+
+    tier: "Tier"
+    backend: str
+    capacity_bytes: int
+    shared: bool = False
+
+
+@dataclass(frozen=True)
+class CapacitySnapshot:
+    """This server's memory capacities at one point in time.
+
+    Carries no revision: the cache-event subscriber numbers declarations as
+    it emits them, on the single event-bus drain thread, so the number and
+    the topology it labels cannot come apart.
+
+    Attributes:
+        modules: One entry per memory compartment.
+    """
+
+    modules: tuple["ModuleMemoryCapacity", ...]
+
+
+@dataclass(frozen=True)
+class KeyEntry:
+    """One entry in a :class:`KeyListPage` including the encoded object
+    key and its object size."""
+
+    key: EncodedObjectKey
+    size_bytes: int
+
+
+@dataclass(frozen=True)
+class KeyListPage:
+    """A page of keys returned by ``L2AdapterInterface.list_l2_keys``."""
+
+    entries: tuple[KeyEntry, ...]
+    """The keys in the current page."""
+
+    next_page_token: str | None
+    """``None`` means this is the last page. Otherwise pass the token
+    verbatim to the next call to fetch the next page."""
+
+
+@dataclass(frozen=True)
+class ShardReplicationDesc:
+    """Per object group, how one chunk's KV is spread over the kv ranks.
+
+    ``group_tp_replicas[g]`` consecutive kv ranks (one tensor-parallel group)
+    hold identical copies of object group ``g``, so they store it once; ``1``
+    stores the group per rank. Under decode context parallelism those ranks
+    hold ``group_dcp_shards[g]`` token shards instead of full copies, rank
+    ``w`` holding shard ``w % group_dcp_shards[g]``. Both tuples are indexed
+    by object group and are empty when no group is replicated, the default.
+
+    Examples, for one chunk of object group ``0`` with 8 kv ranks:
+
+    - ``ShardReplicationDesc()``: every rank holds its own shard. 8 objects, keyed
+      by ranks 0..7, each read by 1 worker.
+    - ``ShardReplicationDesc((8,), (1,))``: a model whose group is replicated on
+      every rank (multi-head latent attention). 1 object, keyed by rank 0,
+      read by 8 workers.
+    - ``ShardReplicationDesc((8,), (2,))``: the same model under DCP=2. 2 objects,
+      keyed by ranks 0 and 1, each read by 4 workers.
+    - ``ShardReplicationDesc((8,), (8,))``: DCP=8. 8 objects, keyed by ranks 0..7,
+      each read by 1 worker.
+    - ``ShardReplicationDesc((8, 1), (2, 1))``: a hybrid model whose object group
+      ``1`` is head-sharded: group ``0`` as in the DCP=2 row, group ``1`` as
+      in the first row.
+    """
+
+    group_tp_replicas: tuple[int, ...] = ()
+    group_dcp_shards: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.group_dcp_shards and len(self.group_dcp_shards) != len(
+            self.group_tp_replicas
+        ):
+            raise ValueError(
+                f"ShardReplicationDesc: group_dcp_shards has "
+                f"{len(self.group_dcp_shards)} entries but group_tp_replicas "
+                f"has {len(self.group_tp_replicas)}"
+            )
+
+    @property
+    def num_object_groups(self) -> int:
+        """Object groups described; ``0`` for the no-replication default."""
+        return len(self.group_tp_replicas)
+
+    def tp_replicas(self, object_group_idx: int) -> int:
+        """Consecutive kv ranks holding identical copies of the group; 1 when
+        the group is stored per rank."""
+        if not self.group_tp_replicas:
+            return 1
+        return self.group_tp_replicas[object_group_idx]
+
+    def dcp_shards(self, object_group_idx: int) -> int:
+        """Token shards the group's ``tp_replicas`` consecutive ranks are
+        split into; 1 without DCP."""
+        if not self.group_dcp_shards:
+            return 1
+        return self.group_dcp_shards[object_group_idx]
+
+    def num_kv_readers(self, object_group_idx: int) -> int:
+        """Workers that retrieve one object of the group: the ranks sharing
+        one token shard, ``tp_replicas // dcp_shards`` (8 for TP=8 DCP=1, 4
+        for TP=8 DCP=2); 1 for a group stored per rank."""
+        return max(
+            1, self.tp_replicas(object_group_idx) // self.dcp_shards(object_group_idx)
+        )
+
+
+DEFAULT_SHARD_REPLICATION_DESC = ShardReplicationDesc()
+"""Every object group stored per rank; the default when a registration
+replicates nothing."""
+
+
+class PrefetchLockMode(enum.Enum):
+    """Whether a prefetch read-locks the objects it makes resident.
+
+    ``LOCK`` -- the prefetched objects are read-locked until the caller
+    releases them.
+
+    ``NO_LOCK`` -- the prefetched objects are left resident and unlocked
+    (immediately evictable).
+    """
+
+    LOCK = enum.auto()
+    NO_LOCK = enum.auto()
+
+
+class PrefetchPriority(enum.Enum):
+    """The order in which waiting prefetch requests are admitted.
+
+    ``NORMAL`` -- waits in arrival order under the in-flight watermark.
+
+    ``HIGH`` -- for a later leg of an admitted lookup (e.g. the CacheBlend
+    sparse leg). No ``NORMAL`` request starts while a ``HIGH`` one waits, so
+    new lookups cannot take the budget an admitted lookup needs to finish.
+    """
+
+    NORMAL = enum.auto()
+    HIGH = enum.auto()
+
+
+@dataclass(frozen=True)
+class GroupedObjectKeys:
+    """The object keys of one ``(object group, kv rank)`` row of a prefetch.
+
+    Attributes:
+        keys: Chunk-ordered object keys in this ``(object group, kv rank)``
+            group (one row of the request).
+        object_group_id: The object group these keys belong to.
+        layout_desc: Memory layout of this object group's objects.
+        sliding_window_size: Number of trailing prefix chunks this object group
+            needs present to serve a prefix: ``FULL_ATTENTION_WINDOW_CHUNKS``
+            (``-1``) for full attention, ``w >= 1`` for a sliding window of
+            ``w`` chunks (``1`` for recurrent state).
+        num_kv_readers: Read locks to take per object of this row -- one per
+            reader that will retrieve it. Ignored under ``NO_LOCK``.
+
+    Note:
+        ``keys[i]`` is the object covering tokens
+        ``[i * chunk_size, (i + 1) * chunk_size)`` of the request for this
+        object group on this kv rank, so a key's index is its chunk index.
+    """
+
+    keys: list[ObjectKey]
+    object_group_id: int
+    layout_desc: MemoryLayoutDesc
+    sliding_window_size: int = FULL_ATTENTION_WINDOW_CHUNKS
+    num_kv_readers: int = 1
+
+    def __post_init__(self) -> None:
+        if self.sliding_window_size == 0 or self.sliding_window_size < -1:
+            raise ValueError(
+                "GroupedObjectKeys: sliding_window_size must be -1 (full attention) "
+                f"or >= 1 chunk, got {self.sliding_window_size}"
+            )
+        if self.num_kv_readers < 1:
+            raise ValueError(
+                f"GroupedObjectKeys: num_kv_readers={self.num_kv_readers} "
+                "must be >= 1 (read locks per object)"
+            )
+
+
+@dataclass(frozen=True)
+class PrefetchTaskSpec:
+    """A prefetch request: which objects to make resident in L1, and how.
+
+    Attributes:
+        key_groups: One :class:`GroupedObjectKeys` row per ``(object group, kv
+            rank)``, each carrying its own ``num_kv_readers``.
+        fetching_policy: See :data:`FetchingPolicy`.
+        lock_mode: See :class:`PrefetchLockMode`.
+        allowed_l1_memory_tags: Memory tags of the L1 managers whose resident
+            objects count as hits. ``None`` allows every L1 manager; an empty
+            set allows none.
+        allowed_l2_memory_tags: Memory tags of the L2 adapters to look up and
+            load from. ``None`` allows every L2 adapter; an empty set allows
+            none.
+        priority: See :class:`PrefetchPriority`.
+
+    Note:
+        Every key group holds the same number of keys (``group_size``). The
+        groups may be listed in any order; the prefetch result is reported
+        per group, in the same order as ``key_groups``.
+
+        Objects loaded from an L2 adapter land in that adapter's affinity L1
+        manager even when its tags are not in ``allowed_l1_memory_tags``. A
+        key already resident there cannot be loaded again and is a miss.
+    """
+
+    key_groups: list[GroupedObjectKeys]
+    fetching_policy: FetchingPolicy = "prefix"
+    lock_mode: PrefetchLockMode = PrefetchLockMode.LOCK
+    allowed_l1_memory_tags: frozenset[MemoryTags] | None = None
+    allowed_l2_memory_tags: frozenset[MemoryTags] | None = None
+    priority: PrefetchPriority = PrefetchPriority.NORMAL
+
+    def __post_init__(self) -> None:
+        if not self.key_groups:
+            raise ValueError("PrefetchTaskSpec: key_groups must not be empty")
+        if self.fetching_policy not in _VALID_FETCHING_POLICIES:
+            raise ValueError(
+                "PrefetchTaskSpec: fetching_policy must be one of "
+                f"{sorted(_VALID_FETCHING_POLICIES)}, got {self.fetching_policy!r}"
+            )
+        sizes = {len(row.keys) for row in self.key_groups}
+        if len(sizes) > 1:
+            raise ValueError(
+                "PrefetchTaskSpec: every key group must have the same number "
+                f"of keys, got {[len(row.keys) for row in self.key_groups]}"
+            )
+
+    @property
+    def group_size(self) -> int:
+        """Number of keys in every key group (the request's chunk count)."""
+        return len(self.key_groups[0].keys)
+
+    @property
+    def group_layout_descs(self) -> dict[int, MemoryLayoutDesc]:
+        """Map each object group id to its memory layout."""
+        return {row.object_group_id: row.layout_desc for row in self.key_groups}
+
+
+@dataclass(frozen=True)
+class PrefetchHandle:
+    """Opaque handle returned by ``StorageManager.submit_prefetch_task``.
+
+    Carries the bookkeeping needed to later query the prefetch status
+    without exposing controller internals.
+    """
+
+    prefetch_request_id: int
+    """Opaque ID for tracking the request in the prefetch controller; -1
+    marks an already-complete empty request."""
+
+    external_request_id: str
+    """Request ID from the caller for end-to-end tracing."""
+
+    total_requested_keys: int
+    """Total number of keys originally requested."""
+
+    submit_time: float
+    """Monotonic timestamp when the prefetch task was submitted."""
+
+    sliding_windows: tuple[int, ...] = ()
+    """Sliding-window size of every key group of the request, in group
+    order; ``FULL_ATTENTION_WINDOW_CHUNKS`` for a full-attention group."""
+
+
+@dataclass(frozen=True)
+class PrefetchResult:
+    """The outcome of a prefetch task, one bitmap per key group of the task.
+
+    Bit ``i`` of ``hit_cells[k]`` is set iff key ``i`` of key group ``k`` is
+    resident in L1 when the task finished (and read-locked under ``LOCK``).
+    ``l1_hit_cells`` marks the hit cells L1 already held, ``l2_hit_cells``
+    those the task loaded from L2.
+
+    Note:
+        ``l1_hit_cells`` and ``l2_hit_cells`` are disjoint and their union is
+        ``hit_cells``.
+
+    ``found_cells`` (superset of ``hit_cells``): what existed at plan time —
+    in L1 or pinned in L2, under every fetching policy. A found cell that is
+    not a hit was left out by the policy or did not fit in L1; it was not
+    evicted. ``None`` when not reported.
+    """
+
+    hit_cells: list["Bitmap"]
+    l1_hit_cells: list["Bitmap"]
+    l2_hit_cells: list["Bitmap"]
+    found_cells: "list[Bitmap] | None" = None
+    l1_owners: dict[ObjectKey, int] = field(default_factory=dict)
+    """Runtime manager IDs holding this request's retained read locks.
+
+    These process-local IDs match MemoryObj ownership and read/write completion;
+    they are not persisted. Tags name configured L1s for affinity and reporting
+    and are the appropriate identity at process boundaries.
+    """
+    _l1_hit_count: int = field(init=False, repr=False, compare=False)
+    _l2_hit_count: int = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        # Frozen dataclass: the cached counts are set through object.__setattr__.
+        object.__setattr__(
+            self, "_l1_hit_count", sum(row.popcount() for row in self.l1_hit_cells)
+        )
+        object.__setattr__(
+            self, "_l2_hit_count", sum(row.popcount() for row in self.l2_hit_cells)
+        )
+
+    @property
+    def l1_hit_count(self) -> int:
+        """Number of hit cells L1 already held."""
+        return self._l1_hit_count
+
+    @property
+    def l2_hit_count(self) -> int:
+        """Number of hit cells loaded from L2."""
+        return self._l2_hit_count
+
+
+def ipc_key_to_object_keys(
+    ipc_key: "IPCCacheServerKey",
+    chunk_hashes: list[bytes],
+    object_group_ids: list[int],
+    shard_replication_desc: ShardReplicationDesc,
+    chunk_size: int | None = None,
+) -> list[list[ObjectKey]]:
+    """
+    Convert a single IPCCacheServerKey and its chunk hashes to per-object-group
+    lists of ObjectKey.
+
+    When the ipc_key's worker_id is None, each chunk hash is exploded into
+    multiple ObjectKeys (one per worker in world_size, or one per token shard
+    per ``tp_replicas`` ranks for a replicated group; see
+    :func:`_lookup_kv_ranks`).
+
+    ``cache_salt`` is read directly from ``ipc_key`` so the produced
+    ObjectKeys are per-user isolated whenever the sender set a non-empty
+    salt. There is intentionally no separate ``cache_salt`` parameter —
+    duplicating the source of truth would risk silent isolation bugs
+    where a caller passes ``ipc_key`` but forgets the salt.
+
+    ``request_configs`` is likewise read from ``ipc_key`` and exposed through
+    every produced key's ``extra_attributes`` field. Each key receives a
+    shallow copy so modules can enrich one key without affecting another.
+
+    Args:
+        ipc_key: The IPC key providing model_name, world_size, worker_id,
+            cache_salt, and request_configs.
+        chunk_hashes: List of chunk hash bytes, one per chunk.
+        object_group_ids: Object group ids to produce keys for.
+        shard_replication_desc: How each object group is spread over the kv ranks
+            (the registration's :class:`ShardReplicationDesc`;
+            :data:`DEFAULT_SHARD_REPLICATION_DESC` stores every group per rank).
+        chunk_size: Effective full chunk size when ``chunk_hashes``
+            identify unfull chunks; adds it as an internal identity tag.
+
+    Returns:
+        list[list[ObjectKey]]: The i-th element is the list of ObjectKeys
+        for ``object_group_ids[i]``.
+    """
+    cache_salt = ipc_key.cache_salt
+    extra_attributes = (
+        ipc_key.request_configs if ipc_key.request_configs is not None else {}
+    )
+    tags = _get_object_identity_tags(ipc_key.request_configs, chunk_size)
+
+    return [
+        [
+            ObjectKey(
+                chunk_hash=chunk_hash,
+                model_name=ipc_key.model_name,
+                kv_rank=kv_rank,
+                object_group_id=object_group_id,
+                cache_salt=cache_salt,
+                extra_attributes=extra_attributes,
+                tags=tags,
+            )
+            for chunk_hash in chunk_hashes
+            for kv_rank in _lookup_kv_ranks(
+                ipc_key,
+                shard_replication_desc.tp_replicas(object_group_id),
+                shard_replication_desc.dcp_shards(object_group_id),
+            )
+        ]
+        for object_group_id in object_group_ids
+    ]
+
+
+def ipc_key_to_grouped_object_keys(
+    ipc_key: "IPCCacheServerKey",
+    chunk_hashes: list[bytes],
+    object_group_ids: list[int],
+    group_layout_descs: dict[int, MemoryLayoutDesc],
+    attn_desc: AttnWindowDesc,
+    shard_replication_desc: ShardReplicationDesc,
+    chunk_size: int | None = None,
+) -> list[GroupedObjectKeys]:
+    """Expand an IPC key and its chunk hashes into prefetch key rows.
+
+    Produces one :class:`GroupedObjectKeys` row per ``(object group, kv rank)``,
+    group-major and rank-minor (all ranks of ``object_group_ids[0]`` first, in
+    rank order, then the next group, ...). Every row is chunk-ordered over
+    ``chunk_hashes``.
+
+    Args:
+        ipc_key: The IPC key providing model_name, world_size, worker_id,
+            and cache_salt.
+        chunk_hashes: Chunk hash bytes, one per chunk, in token order.
+        object_group_ids: Object group ids to produce rows for, in the order
+            the rows should appear.
+        group_layout_descs: Maps each object group id to its memory layout.
+        attn_desc: Registration-wide attention windows; the window of object
+            group ``g`` is ``attn_desc.num_chunks_in_sw[g]``.
+        shard_replication_desc: How each object group is spread over the kv ranks; a
+            replicated group yields one row per token shard per
+            ``tp_replicas`` ranks, with ``num_kv_readers`` the ranks sharing
+            that shard.
+        chunk_size: Effective full chunk size when ``chunk_hashes``
+            identify unfull chunks; adds it as an internal identity tag.
+
+    Returns:
+        ``len(object_group_ids) * num_ranks`` rows, group-major / rank-minor.
+
+    Raises:
+        ValueError: If an object group id has no layout in
+            ``group_layout_descs`` or no window in ``attn_desc``.
+
+    Note:
+        A key without ``worker_id`` fans out to every kv rank of its world
+        size; a worker-specific key yields that rank only. ``cache_salt`` is
+        taken from ``ipc_key``. Every produced key receives a shallow copy of
+        ``ipc_key.request_configs`` through ``extra_attributes`` when request
+        configs are present.
+    """
+    tags = _get_object_identity_tags(ipc_key.request_configs, chunk_size)
+    extra_attributes = (
+        ipc_key.request_configs if ipc_key.request_configs is not None else {}
+    )
+    rows: list[GroupedObjectKeys] = []
+    for object_group_id in object_group_ids:
+        layout_desc = group_layout_descs.get(object_group_id)
+        if layout_desc is None:
+            raise ValueError(
+                f"ipc_key_to_grouped_object_keys: no layout for object group "
+                f"{object_group_id} (have {sorted(group_layout_descs)})"
+            )
+        if not 0 <= object_group_id < attn_desc.num_object_groups:
+            raise ValueError(
+                f"ipc_key_to_grouped_object_keys: object group {object_group_id} is "
+                f"outside attn_desc's {attn_desc.num_object_groups} groups"
+            )
+        window = attn_desc.num_chunks_in_sw[object_group_id]
+        num_kv_readers = shard_replication_desc.num_kv_readers(object_group_id)
+        for kv_rank in _lookup_kv_ranks(
+            ipc_key,
+            shard_replication_desc.tp_replicas(object_group_id),
+            shard_replication_desc.dcp_shards(object_group_id),
+        ):
+            rows.append(
+                GroupedObjectKeys(
+                    keys=[
+                        ObjectKey(
+                            chunk_hash=chunk_hash,
+                            model_name=ipc_key.model_name,
+                            kv_rank=kv_rank,
+                            object_group_id=object_group_id,
+                            cache_salt=ipc_key.cache_salt,
+                            extra_attributes=extra_attributes,
+                            tags=tags,
+                        )
+                        for chunk_hash in chunk_hashes
+                    ],
+                    object_group_id=object_group_id,
+                    layout_desc=layout_desc,
+                    sliding_window_size=window,
+                    num_kv_readers=num_kv_readers,
+                )
+            )
+    return rows

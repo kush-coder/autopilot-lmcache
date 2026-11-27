@@ -1,0 +1,215 @@
+# SPDX-License-Identifier: Apache-2.0
+"""CPU-only caller tests for the TensorRT-LLM multiprocess adapter."""
+
+# Standard
+from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock
+import builtins
+import importlib
+import sys
+
+# Third Party
+import pytest
+
+
+@pytest.fixture
+def trt_mp_module(monkeypatch: pytest.MonkeyPatch):
+    """Import the adapter with its optional TensorRT-LLM API stubbed."""
+
+    class _ConnectorBase:
+        def __init__(self, llm_args: object) -> None:
+            self._llm_args = llm_args
+
+    modules = {
+        name: ModuleType(name)
+        for name in (
+            "tensorrt_llm",
+            "tensorrt_llm._torch",
+            "tensorrt_llm._torch.pyexecutor",
+            "tensorrt_llm._torch.pyexecutor.connectors",
+            "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector",
+            "tensorrt_llm.bindings",
+            "tensorrt_llm.bindings.internal",
+            "tensorrt_llm.bindings.internal.batch_manager",
+            "tensorrt_llm.llmapi",
+            "tensorrt_llm.llmapi.llm_args",
+        )
+    }
+    modules["tensorrt_llm"].mpi_rank = lambda: 0  # type: ignore[attr-defined]
+    connector_module = modules[
+        "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector"
+    ]
+    connector_module.KvCacheConnectorScheduler = _ConnectorBase  # type: ignore[attr-defined]
+    connector_module.KvCacheConnectorWorker = _ConnectorBase  # type: ignore[attr-defined]
+    connector_module.SchedulerOutput = object  # type: ignore[attr-defined]
+    modules["tensorrt_llm.bindings.internal.batch_manager"].LlmRequest = object  # type: ignore[attr-defined]
+    modules["tensorrt_llm.llmapi.llm_args"].TorchLlmArgs = object  # type: ignore[attr-defined]
+
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    module_name = "lmcache.integration.tensorrt_llm.tensorrt_mp_adapter"
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+    module = importlib.import_module(module_name)
+    yield module
+    sys.modules.pop(module_name, None)
+
+
+def test_failed_retrieve_waits_for_device_result_and_fails_closed(
+    trt_mp_module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A False device transfer result cannot be treated as a loaded KV hit."""
+    module = trt_mp_module
+    worker = module.LMCacheMPKvConnectorWorker.__new__(
+        module.LMCacheMPKvConnectorWorker
+    )
+    worker._metadata = module.LMCacheMPConnectorMetadata(
+        loads={7: module._BlockSpec(tokens=[1, 2], block_ids=[3])}
+    )
+    worker._req_client = MagicMock(name="req_client")
+    worker._mq_timeout = 5.0
+    worker._instance_id = 42
+    worker._device = "cpu"
+    worker._create_key = MagicMock(return_value=SimpleNamespace())
+
+    event = MagicMock(name="event")
+    event.ipc_handle.return_value = b"producer-event"
+    event_backend = MagicMock(name="event_backend")
+    event_backend.create_event.return_value = event
+    event_backend.export_event.side_effect = (
+        lambda exported_event, device: exported_event.ipc_handle()
+    )
+    worker._event_backend = event_backend
+
+    device_future = MagicMock(name="device_future")
+    device_future.result.return_value = False
+    raw_future = MagicMock(name="raw_future")
+    raw_future.to_device_future.return_value = device_future
+    worker._req_client.retrieve.return_value = raw_future
+
+    with pytest.raises(RuntimeError, match="refusing to use unloaded KV blocks"):
+        worker.start_load_kv(MagicMock(name="stream"))
+
+    raw_future.to_device_future.assert_called_once_with(
+        device="cpu",
+        event_backend=event_backend,
+    )
+    raw_future.retain_reference.assert_called_once_with(event)
+    device_future.result.assert_called_once_with(timeout=5.0)
+
+
+def test_lookup_uses_block_aligned_server_chunk_size(
+    trt_mp_module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TensorRT-LLM lookup boundaries use the aligned server minimum."""
+    module = trt_mp_module
+    client = MagicMock(name="req_client")
+    client.get_chunk_size.return_value.result.return_value = 250
+    client.query_prefetch_status.return_value.result.return_value = 0
+    monkeypatch.setattr(
+        module.RequestClientFactory,
+        "create",
+        MagicMock(return_value=client),
+    )
+    llm_args = SimpleNamespace(
+        kv_cache_config=SimpleNamespace(tokens_per_block=64),
+        kv_connector_config=SimpleNamespace(server_url="tcp://127.0.0.1:5555"),
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        model="trt-test-model",
+    )
+    scheduler = module.LMCacheMPKvConnectorScheduler(llm_args)
+    request = SimpleNamespace(request_id=7, get_tokens=lambda beam: list(range(300)))
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert client.lookup.call_args.args[0].end == 256
+
+
+def test_store_wait_retains_event_on_raw_future(
+    trt_mp_module,
+) -> None:
+    """A timed store keeps its exported event alive on the raw future."""
+    module = trt_mp_module
+    worker = module.LMCacheMPKvConnectorWorker.__new__(
+        module.LMCacheMPKvConnectorWorker
+    )
+    worker._metadata = module.LMCacheMPConnectorMetadata(
+        saves={7: module._BlockSpec(tokens=[1, 2], block_ids=[3])}
+    )
+    worker._req_client = MagicMock(name="req_client")
+    worker._mq_timeout = 5.0
+    worker._instance_id = 42
+    worker._device = "cpu"
+    worker._create_key = MagicMock(return_value=SimpleNamespace())
+
+    event = MagicMock(name="event")
+    event.ipc_handle.return_value = b"producer-event"
+    event_backend = MagicMock(name="event_backend")
+    event_backend.create_event.return_value = event
+    event_backend.export_event.side_effect = (
+        lambda exported_event, device: exported_event.ipc_handle()
+    )
+    worker._event_backend = event_backend
+
+    device_future = MagicMock(name="device_future")
+    device_future.result.return_value = True
+    raw_future = MagicMock(name="raw_future")
+    raw_future.to_device_future.return_value = device_future
+    worker._req_client.store.return_value = raw_future
+
+    worker.wait_for_save(MagicMock(name="stream"))
+
+    raw_future.to_device_future.assert_called_once_with(
+        device="cpu",
+        event_backend=event_backend,
+    )
+    raw_future.retain_reference.assert_called_once_with(event)
+    device_future.result.assert_called_once_with(timeout=5.0)
+
+
+def test_lookup_carries_trt_prefix_hit_hint(trt_mp_module) -> None:
+    """The LOOKUP reports TensorRT-LLM's prefix-cache hit to the server's KV
+    load policy."""
+    module = trt_mp_module
+    scheduler = module.LMCacheMPKvConnectorScheduler.__new__(
+        module.LMCacheMPKvConnectorScheduler
+    )
+    scheduler._block_size = 4
+    scheduler._chunk_size = 4
+    scheduler._pending = {}
+    scheduler._mq_timeout = 5.0
+    scheduler._model_name = "m"
+    scheduler._world_size = 1
+    scheduler._req_client = MagicMock(name="req_client")
+    scheduler._req_client.query_prefetch_status.return_value.result.return_value = 0
+    request = SimpleNamespace(request_id=7, get_tokens=lambda beam: list(range(16)))
+
+    assert scheduler.get_num_new_matched_tokens(request, 4) == (0, False)
+
+    lookup_key = scheduler._req_client.lookup.call_args.args[0]
+    assert lookup_key.request_configs == {"lmcache.hint.engine_computed_tokens": 4}
+
+
+def test_package_import_does_not_load_inprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The MP package must not attempt to import the optional InProcess engine."""
+    original_import = builtins.__import__
+
+    def import_without_inprocess(
+        name: str,
+        globals: dict[str, object] | None = None,
+        locals: dict[str, object] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> ModuleType:
+        if name == "lmcache.inprocess" or name.startswith("lmcache.inprocess."):
+            pytest.fail(f"core TensorRT package attempted optional import: {name}")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_inprocess)
+    module = importlib.import_module("lmcache.integration.tensorrt_llm")
+    importlib.reload(module)
+    assert "LMCacheKvConnectorScheduler" not in module.__all__

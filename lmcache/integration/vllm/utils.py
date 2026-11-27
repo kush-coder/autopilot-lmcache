@@ -1,0 +1,396 @@
+# SPDX-License-Identifier: Apache-2.0
+# Standard
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, Tuple
+import functools
+import hashlib
+
+if TYPE_CHECKING:
+    from vllm.config import ModelConfig, VllmConfig
+    from vllm.lora.request import LoRARequest
+    from vllm.multimodal.inputs import PlaceholderRange
+    from vllm.v1.request import Request
+
+# Third Party
+import torch
+
+# First Party
+from lmcache import torch_device_type
+from lmcache.v1.common.kv_format.types import KVLayoutName
+from lmcache.v1.common.logging import init_logger
+
+# Kept for LMCache_inprocess and LMCache-Ascend, which import it from this module.
+from lmcache.v1.common.utils import get_size_bytes as get_size_bytes
+
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.common.utils import LayoutHints
+
+logger = init_logger(__name__)
+ENGINE_NAME = "vllm-instance"
+
+
+def is_false(value: str) -> bool:
+    """Check if the given string value is equivalent to 'false'."""
+    return value.lower() in ("false", "0", "no", "n", "off")
+
+
+def vllm_layout_hints(vllm_config: "VllmConfig | None" = None) -> "LayoutHints":
+    """Build layout_hints dict by querying vLLM at runtime."""
+    hints: dict[str, str] = {}
+    kv_layout = try_get_vllm_kv_cache_layout(vllm_config)
+    if kv_layout is None and torch_device_type == "cpu":
+        kv_layout = "HND"
+    if kv_layout is not None:
+        hints["kv_layout"] = kv_layout
+    return hints  # type: ignore[return-value]
+
+
+def translate_vllm_kv_cache_layout(kv_cache_layout: str) -> KVLayoutName:
+    """Map a vLLM ``KVCacheLayout`` member name to LMCache's name
+    (``LBNHC`` -> ``NHD``, ``LBHNC`` -> ``HND``).
+
+    Raises:
+        NotImplementedError: for layouts LMCache cannot transfer.
+    """
+    names = {
+        "NHD": "NHD",
+        "HND": "HND",
+        "LBNHC": "NHD",
+        "LBHNC": "HND",
+        "BLHNC": "BLHNC",
+        "BLNHC": "BLNHC",
+    }
+    translated = names.get(kv_cache_layout)
+    if translated is not None:
+        return translated  # type: ignore[return-value]
+    # TODO: support heads-outermost layouts; the transfer kernels address
+    # one contiguous run per (layer, block), which these fragment per head.
+    raise NotImplementedError(
+        f"LMCache does not support the {kv_cache_layout!r} KV cache "
+        "layout: per-block content is fragmented per head. If it was "
+        "selected via VLLM_KV_CACHE_LAYOUT, unset it or choose LBNHC, "
+        "LBHNC, BLHNC, or BLNHC."
+    )
+
+
+def try_get_vllm_kv_cache_layout(
+    vllm_config: "VllmConfig | None" = None,
+) -> KVLayoutName | None:
+    """Return vLLM's resolved KV cache layout as LMCache's name.
+
+    Returns ``None`` when vLLM is unavailable (i.e. the MP server).
+    Legacy CPU, Neuron, and MLU backends use physical HND caches even when
+    vLLM's generic backend query reports NHD. Resolved layouts take precedence.
+
+    Raises:
+        ValueError: from vLLM, if the layout has not been resolved yet;
+            hints must be built at KV-cache registration time.
+    """
+    try:
+        if vllm_config is None:
+            # Third Party
+            from vllm.config import get_current_vllm_config
+
+            vllm_config = get_current_vllm_config()
+        cache_config = vllm_config.cache_config
+    except Exception:
+        logger.error(
+            "vLLM is not available but tried to query kv cache "
+            "layout information, cannot get KV cache layout"
+        )
+        return None
+
+    # vllm#51718 and later: vLLM owns alias resolution, unknown-name
+    # validation, and the not-yet-resolved error.
+    if hasattr(cache_config, "get_resolved_kv_cache_layout"):
+        return translate_vllm_kv_cache_layout(
+            cache_config.get_resolved_kv_cache_layout().name
+        )
+
+    try:
+        # Third Party
+        from vllm.v1.attention.backends.utils import (  # type: ignore[import-untyped]
+            get_kv_cache_layout,
+        )
+    except Exception:
+        logger.error("Could not query the KV cache layout from this vLLM version")
+        return None
+
+    kv_layout = translate_vllm_kv_cache_layout(get_kv_cache_layout())
+    # Legacy vLLM could report NHD on CPU even though the CPU attention backend
+    # physically allocated [B, H, N, C] (HND). Post-vllm#51718 layouts are
+    # returned from CacheConfig above, so normalize only this legacy fallback.
+    # vllm-neuron and vllm-mlu likewise allocate [2, NB, NH, BS, HS].
+    if torch_device_type in ("cpu", "neuron", "mlu") and kv_layout in ("NHD", "HND"):
+        return "HND"
+    return kv_layout
+
+
+def extract_request_configs_from_sampling_params(
+    sampling_params: object,
+) -> dict[str, Any] | None:
+    """Extract LMCache request configs from a vLLM sampling-params object.
+
+    Only ``lmcache.*`` entries from ``extra_args["kv_transfer_params"]`` are
+    forwarded. Other transfer params are transport-only metadata and must not
+    participate in LMCache key derivation.
+    """
+    extra_args = getattr(sampling_params, "extra_args", None)
+    if not isinstance(extra_args, Mapping):
+        return None
+    kv_transfer_params = extra_args.get("kv_transfer_params")
+    if not isinstance(kv_transfer_params, Mapping):
+        return None
+
+    request_configs = {
+        key: value
+        for key, value in kv_transfer_params.items()
+        if isinstance(key, str) and key.startswith("lmcache.")
+    }
+    return request_configs or None
+
+
+def extract_request_configs_from_request(
+    request: "Request",
+) -> dict[str, Any] | None:
+    """Extract LMCache request configs from a vLLM request object."""
+    return extract_request_configs_from_sampling_params(
+        getattr(request, "sampling_params", None)
+    )
+
+
+# Request config that carries the vLLM LoRA adapter into the cache keys
+LORA_TAG_KEY = "lmcache.tag.lora"
+
+
+def lora_cache_tag(lora_request: "LoRARequest") -> str:
+    """Return the cache key tag value for a vLLM LoRA adapter.
+
+    The tag is a 128-bit BLAKE2b digest of the adapter name and path. Hashing
+    the path with the name follows vLLM's prefix cache
+    (vllm-project/vllm#59335): a name re-pointed at different weights misses
+    instead of hitting stale KV. A short hex digest also keeps adapter names
+    out of key strings and keeps tagged storage file names short.
+
+    Args:
+        lora_request: The adapter the request runs with.
+
+    Returns:
+        A 32-character lowercase hex digest.
+    """
+    payload = f"{lora_request.lora_name}\0{lora_request.lora_path}"
+    return hashlib.blake2b(payload.encode(), digest_size=16).hexdigest()
+
+
+def apply_lora_tag(
+    request_configs: dict[str, Any] | None,
+    lora_request: "LoRARequest | None",
+) -> dict[str, Any] | None:
+    """Make a request's LoRA adapter part of its cache keys.
+
+    ``lmcache.tag.*`` request configs are part of the cache key, so the base
+    model and each adapter get separate keys for the same tokens. The
+    connector owns ``lmcache.tag.lora``: a value sent by the client in
+    ``kv_transfer_params`` is dropped, so a request can only read and write
+    the cache of the adapter it actually runs with.
+
+    Args:
+        request_configs: Configs from
+            ``extract_request_configs_from_sampling_params``.
+        lora_request: The request's adapter, or None for the base model.
+
+    Returns:
+        A new dict with the client configs except ``lmcache.tag.lora``, plus
+        ``lmcache.tag.lora`` for an adapter request; None when no config is
+        left.
+    """
+    configs = {
+        key: value
+        for key, value in (request_configs or {}).items()
+        if key != LORA_TAG_KEY
+    }
+    if lora_request is not None:
+        configs[LORA_TAG_KEY] = lora_cache_tag(lora_request)
+    return configs or None
+
+
+# Number of bits kept per substituted placeholder token. 31 bits keeps the
+# values positive in a signed int32, the narrowest integer type token IDs may
+# pass through on any downstream serialization path.
+_MM_TOKEN_VALUE_BITS = 31
+_MM_TOKEN_VALUE_MASK = (1 << _MM_TOKEN_VALUE_BITS) - 1
+# SHA-256 digests are 32 bytes; each substituted value consumes 4 bytes.
+_MM_VALUES_PER_DIGEST = 8
+
+
+@functools.lru_cache(maxsize=256)
+def mm_hash_to_token_values(identifier: str, length: int) -> Tuple[int, ...]:
+    """
+    Derive a deterministic sequence of pseudo-token values from a full
+    multimodal identifier.
+
+    The returned values replace the placeholder token IDs of one multimodal
+    item before token-based chunk hashing, so that the chunk hashes carry the
+    item's full content identity. Every position gets a distinct value derived
+    from ``(identifier, position)``, which means:
+
+    - Two different items produce entirely different sequences (collision
+      probability per overlapping token is 2^-31, and any chunk overlapping
+      k placeholder tokens carries 31*k bits of item identity).
+    - The value at a given offset within the item is stable regardless of how
+      the surrounding tokens are chunked, preserving prefix-hash stability.
+    - Prefixes are consistent: ``mm_hash_to_token_values(x, m)`` is a prefix
+      of ``mm_hash_to_token_values(x, n)`` for ``m <= n``.
+
+    Args:
+        identifier: The multimodal identifier (vLLM ``mm_hash``). Treated as
+            an opaque string; both content hashes and request-scoped
+            identifiers (e.g. ``chatcmpl-...-image-0``) are accepted.
+        length: The number of values to derive (the placeholder span length).
+            Must be non-negative.
+
+    Returns:
+        A tuple of ``length`` integers, each in ``[0, 2**31)``.
+
+    Raises:
+        ValueError: If ``length`` is negative.
+    """
+    if length < 0:
+        raise ValueError(f"length must be non-negative, got {length}")
+    # Be defensive: vLLM may pass non-string identifiers.
+    seed = hashlib.sha256(str(identifier).encode("utf-8")).digest()
+    values: list[int] = []
+    for counter in range((length + _MM_VALUES_PER_DIGEST - 1) // _MM_VALUES_PER_DIGEST):
+        block = hashlib.sha256(seed + counter.to_bytes(8, byteorder="big")).digest()
+        for i in range(0, len(block), 4):
+            values.append(
+                int.from_bytes(block[i : i + 4], byteorder="big") & _MM_TOKEN_VALUE_MASK
+            )
+    return tuple(values[:length])
+
+
+def apply_mm_hashes_to_token_ids(
+    token_ids: torch.Tensor,
+    mm_hashes: list[str],
+    mm_positions: list["PlaceholderRange"],
+) -> torch.Tensor:
+    """
+    Overwrite multimodal placeholder spans of ``token_ids`` in-place with
+    values derived from the corresponding full multimodal identifiers.
+
+    vLLM emits identical placeholder token IDs for every multimodal item, so
+    without this substitution two different images would produce identical
+    chunk hashes (and thus silently share KV cache entries). Each placeholder
+    span is filled with the per-position sequence from
+    :func:`mm_hash_to_token_values`, which carries the full identifier
+    entropy into every chunk that overlaps the span.
+
+    Args:
+        token_ids: 1-D tensor of token IDs to modify in-place. Must be the
+            full prompt or a prefix of it, because ``mm_positions`` offsets
+            are absolute: a suffix or a mid-slice would overwrite unrelated
+            positions and leave the placeholder spans untouched, silently
+            restoring the cross-image collision this substitution exists to
+            prevent. A prefix is fine; spans are truncated to its length.
+        mm_hashes: Multimodal identifiers, parallel to ``mm_positions``.
+        mm_positions: Placeholder ranges (``offset``/``length``) within the
+            full prompt, parallel to ``mm_hashes``.
+
+    Returns:
+        The same ``token_ids`` tensor, modified in-place.
+    """
+    n = token_ids.size(0)
+    for hash_str, placeholder in zip(mm_hashes, mm_positions, strict=False):
+        start, length = placeholder.offset, placeholder.length
+        if start >= n:
+            continue
+        end = min(start + length, n)
+        values = mm_hash_to_token_values(hash_str, end - start)
+        token_ids[start:end] = torch.tensor(values, dtype=token_ids.dtype)
+    return token_ids
+
+
+def mla_enabled(model_config: "ModelConfig") -> bool:
+    return (
+        hasattr(model_config, "use_mla")
+        and isinstance(model_config.use_mla, bool)
+        and model_config.use_mla
+    )
+
+
+def extract_mm_features(
+    request: "Request", modify: bool = False
+) -> Tuple[list[str], list["PlaceholderRange"]]:
+    """
+    Normalize multimodal information from a Request into parallel lists.
+
+    This helper reads either:
+      1) `request.mm_features` (objects each exposing `.identifier` and
+      `.mm_position`), or
+      2) legacy fields `request.mm_hashes` and `request.mm_positions`.
+
+    It returns two equally sized lists: the multimodal hash identifiers and their
+    corresponding positions. If the request contains no multimodal info, it returns
+    `([], [])`.
+
+    Args:
+        request (Request): The source object.
+        modify (bool):
+            Controls copy semantics for the legacy-path return values.
+            - If True and legacy fields are used, shallow-copies are returned so
+              the caller can mutate the lists without affecting `request`.
+            - If False, the original legacy sequences are returned as-is
+              (zero-copy); treat them as read-only.
+
+    Returns:
+        Tuple[list[str], list[PlaceholderRange]]: (`mm_hashes`, `mm_positions`).
+        May be `([], [])` when no multimodal data is present.
+    """
+    if getattr(request, "mm_features", None):
+        mm_hashes, mm_positions = zip(
+            *((f.identifier, f.mm_position) for f in request.mm_features), strict=False
+        )
+        return (list(mm_hashes), list(mm_positions))
+    elif getattr(request, "mm_hashes", None):
+        if modify:
+            return (request.mm_hashes.copy(), request.mm_positions.copy())
+        else:
+            return (request.mm_hashes, request.mm_positions)
+    else:
+        return ([], [])
+
+
+def calculate_draft_layers(vllm_config: "VllmConfig") -> int:
+    """Calculate the number of draft layers for speculative decoding."""
+    assert vllm_config is not None, "vllm_config required for vLLM mode"
+
+    num_draft_layers = 0
+    model_config = vllm_config.model_config
+
+    if vllm_config.speculative_config is not None:
+        logger.info(
+            "vllm_config.speculative_config: %s", vllm_config.speculative_config
+        )
+        if vllm_config.speculative_config.method == "deepseek_mtp":
+            num_draft_layers = getattr(
+                model_config.hf_config, "num_nextn_predict_layers", 0
+            )
+        elif vllm_config.speculative_config.use_eagle():
+            try:
+                draft_model_config = vllm_config.speculative_config.draft_model_config
+                num_draft_layers = draft_model_config.get_num_layers(
+                    vllm_config.parallel_config
+                )
+                logger.info("EAGLE detected %d extra layer(s)", num_draft_layers)
+            except Exception:
+                logger.info(
+                    "EAGLE detected, but failed to get the number of extra layers"
+                    "falling back to 1"
+                )
+                num_draft_layers = 1
+    return num_draft_layers
+
+
+def is_dp_rank0(vllm_config: "VllmConfig") -> bool:
+    return vllm_config.parallel_config.data_parallel_rank_local == 0

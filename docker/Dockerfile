@@ -1,0 +1,162 @@
+# The LMCache Dockerfile is used to build a LMCache image that is integrated
+# to run with vLLM OpenAI server.
+
+# Please update any changes made here to
+# docs/source/developer_guide/docker_file.rst
+# docs/source/getting_started/installation.rst
+# docs/source/production/docker_deployment.rst
+
+ARG CUDA_VERSION=13.2
+ARG UBUNTU_VERSION=24.04
+ARG NGC_VERSION=26.05
+ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:${NGC_VERSION}-cuda${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
+
+#################### BASE BUILD IMAGE ####################
+# Prepare basic build environment
+
+FROM ${BASE_IMAGE} AS base
+
+ARG CUDA_VERSION
+ARG PYTHON_VERSION=3.12
+ARG UBUNTU_VERSION
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/opt/venv/bin:${PATH}"
+
+# Install Python and other dependencies
+RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
+    && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
+    && apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        ccache software-properties-common git curl sudo \
+        python3 python3-dev python3-venv python3-pip tzdata libxcb1-dev \
+    && ldconfig /usr/local/cuda-$(echo $CUDA_VERSION | cut -d. -f1,2)/compat/ \
+    && curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && mv ~/.local/bin/uv /usr/local/bin/ \
+    && mv ~/.local/bin/uvx /usr/local/bin/ \
+    && uv venv /opt/venv \
+    && . /opt/venv/bin/activate \
+    && python3 --version
+
+WORKDIR /workspace
+
+# The NGC Ubuntu base reserves uid 1000 for its default ubuntu account.
+# Replace that account with a dedicated user to reduce container privileges.
+RUN if [ "$(getent passwd 1000 | cut -d: -f1)" = "ubuntu" ]; then userdel ubuntu; fi \
+    && useradd --create-home --uid 1000 --shell /usr/sbin/nologin lmcache \
+    && mkdir -p /home/lmcache/.cache/huggingface \
+    && chown -R lmcache:lmcache /workspace /home/lmcache/.cache
+
+# CUDA arch list used by torch
+ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 12.0+PTX'
+ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
+
+#################### vLLM IMAGE & LMCache (Build) ##########################
+# Integrate vLLM nightly build and LMCache build, and expose vLLM OpenAI API
+
+FROM base AS image-build
+
+# install build dependencies
+COPY ./requirements/build.txt build.txt
+
+# Max jobs used by Ninja to build extensions
+ARG max_jobs=2
+ENV MAX_JOBS=${max_jobs}
+
+# Number of threads used by nvcc
+ARG nvcc_threads=auto
+ENV NVCC_THREADS=$nvcc_threads
+
+ARG CUDA_VERSION
+ARG VLLM_VERSION=nightly
+
+RUN --mount=type=cache,target=/root/.cache/uv,id=uv-cache,sharing=locked \
+    . /opt/venv/bin/activate && \
+    uv pip install -r build.txt
+
+ARG LMCACHE_COMMIT_ID=1
+
+COPY . /workspace/LMCache
+WORKDIR /workspace/LMCache
+
+ 
+RUN --mount=type=cache,target=/root/.cache/ccache,id=ccache \
+    --mount=type=cache,target=/root/.cache/uv,id=uv-cache,sharing=locked \
+    . /opt/venv/bin/activate && \
+    CUDA_TAG=cu$(echo ${CUDA_VERSION} | tr -d '.') && \
+    export LMCACHE_CUDA_MAJOR=$(echo ${CUDA_VERSION} | cut -d. -f1) && \
+    if [ "$VLLM_VERSION" = "nightly" ]; then \
+        VLLM_PRECOMPILED_WHEEL_VARIANT=${CUDA_TAG} uv pip install --prerelease=allow \
+            'vllm[runai,tensorizer,flashinfer]' \
+            --extra-index-url https://wheels.vllm.ai/nightly/${CUDA_TAG} \
+            --extra-index-url https://download.pytorch.org/whl/${CUDA_TAG} \
+            --index-strategy unsafe-first-match ; \
+    else \
+        VLLM_PRECOMPILED_WHEEL_VARIANT=${CUDA_TAG} uv pip install --prerelease=allow \
+            "vllm[runai,tensorizer,flashinfer]==${VLLM_VERSION}" ; \
+    fi && \
+    uv pip install "nixl<2" && \
+    python3 -c 'import torch; print("TORCH=", torch.__version__)' && \
+    python3 -c 'import importlib.metadata as m; print("NIXL=", m.version("nixl"))' && \
+    python3 setup.py bdist_wheel --dist-dir=dist_lmcache && \
+    bash docker/build_raw_block_wheel.sh dist_lmcache && \
+    bash docker/build_nixl_wheel.sh dist_lmcache && \
+    uv pip install ./dist_lmcache/*.whl --verbose && \
+    python3 .github/scripts/assert_native_ops.py && \
+    python3 -c 'import lmcache_rust_raw_block_io' && \
+    uv pip install -r requirements/grpc_native.txt && \
+    python3 -c 'import pygrpc_native' && \
+    uv pip install -r requirements/kafka.txt && \
+    python3 -c 'import confluent_kafka' && \
+    python3 -c 'import nixl, lmcache_nixl'
+
+WORKDIR /workspace
+USER lmcache
+ENTRYPOINT ["/opt/venv/bin/vllm", "serve"]
+
+#################### vLLM IMAGE & LMCache (Release, cu13) #######################
+# Integrate vLLM and LMCache stable releases, and expose vLLM OpenAI API.
+# The default lmcache wheel on PyPI is built against cu13; the cu13 torch
+# index is hinted explicitly so vLLM also resolves to its cu13 build.
+
+FROM base AS image-release
+
+ARG CUDA_VERSION
+
+ARG LMCACHE_VERSION
+
+RUN --mount=type=bind,source=requirements/grpc_native.txt,target=/tmp/grpc_native.txt \
+    --mount=type=bind,source=requirements/kafka.txt,target=/tmp/kafka.txt \
+    --mount=type=bind,source=.github/scripts/assert_native_ops.py,target=/tmp/assert_native_ops.py \
+    . /opt/venv/bin/activate && \
+    CUDA_TAG=cu$(echo ${CUDA_VERSION} | tr -d '.') && \
+    CUDA_MAJOR=$(echo ${CUDA_VERSION} | cut -d. -f1) && \
+    VER=$(echo "${LMCACHE_VERSION}" | sed 's/^v//') && \
+    VLLM_PRECOMPILED_WHEEL_VARIANT=${CUDA_TAG} uv pip install --prerelease=allow \
+        vllm[runai,tensorizer,flashinfer] \
+        --extra-index-url https://download.pytorch.org/whl/${CUDA_TAG} \
+        --index-strategy unsafe-best-match && \
+    # A torch-family pin that has no wheel for CUDA_TAG is installed from PyPI,
+    # built for another CUDA version, and vLLM then exits at startup.
+    # torchaudio checks this on import, so fail the build here instead.
+    python3 -c 'import torchaudio' && \
+    # The nixl extra adds the NIXL connector (lmcache-nixl) at lmcache's version.
+    uv pip install "lmcache[nixl]${VER:+==${VER}}" \
+        --extra-index-url https://download.pytorch.org/whl/${CUDA_TAG} \
+        --index-strategy unsafe-best-match --verbose && \
+    # The PyPI wheel is compiled against pyproject's torch pin, not the torch
+    # vLLM just installed; fail here if they drifted (cuda_ops ABI mismatch).
+    python3 /tmp/assert_native_ops.py && \
+    # The Rust module is published at lmcache's version; pin it to the lmcache
+    # actually installed, so the two match even when LMCACHE_VERSION is unset.
+    LMCACHE_INSTALLED=$(python3 -c 'import importlib.metadata as m; print(m.version("lmcache"))') && \
+    uv pip install "lmcache-rust-raw-block-io==${LMCACHE_INSTALLED}" && \
+    python3 -c 'import lmcache_rust_raw_block_io' && \
+    uv pip install -r /tmp/grpc_native.txt && \
+    python3 -c 'import pygrpc_native' && \
+    uv pip install -r /tmp/kafka.txt && \
+    python3 -c 'import confluent_kafka' && \
+    python3 -c 'import nixl, lmcache_nixl'
+
+WORKDIR /workspace
+USER lmcache
+ENTRYPOINT ["/opt/venv/bin/vllm", "serve"]

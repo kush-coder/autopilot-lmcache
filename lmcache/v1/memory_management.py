@@ -1,0 +1,1413 @@
+# SPDX-License-Identifier: Apache-2.0
+# Standard
+from dataclasses import dataclass
+from functools import cache, wraps
+from typing import Any, Callable, Optional, Protocol, Tuple
+import ctypes
+import os
+import threading
+
+# Third Party
+from sortedcontainers import SortedList
+import torch
+
+# First Party
+from lmcache import device_ops, torch_dev
+from lmcache import torch_device_type as torch_device_type  # noqa: F401
+from lmcache.v1.common.logging import init_logger
+from lmcache.v1.common.memory_management import (
+    MemoryAllocatorInterface as MemoryAllocatorInterface,
+)
+from lmcache.v1.common.memory_management import MemoryFormat as MemoryFormat
+from lmcache.v1.common.memory_management import MemoryObj as MemoryObj
+from lmcache.v1.common.memory_management import MemoryObjMetadata as MemoryObjMetadata
+from lmcache.v1.common.utils import _lmcache_nvtx_annotate
+from lmcache.v1.platform import current_device_spec as current_device_spec  # noqa: F401
+from lmcache.v1.system_detection import NUMAMapping
+
+logger = init_logger(__name__)
+
+
+# Cache for ctypes ubyte-array types keyed by length.
+#
+# ctypes does not cache `(c_ubyte * N)` array types -- each call to the `*`
+# operator builds a fresh heap type via PyCArrayType_from_ctype. The heap
+# type metadata stays alive forever (held by the type system), so calling
+# `(ctypes.c_ubyte * N).from_address(...)` on every TensorMemoryObj.byte_array
+# access leaks ~1-2 kB per call. Under long-running remote-backend put/get
+# workloads this is the dominant source of monotonic anonymous-memory growth
+# (see https://github.com/LMCache/LMCache/issues/3767).
+#
+# Caching by length is safe: the `from_address(addr)` instance never owns the
+# underlying buffer, only the metadata (length, item-type), and that metadata
+# depends solely on `N`. ``functools.cache`` provides a thread-safe unbounded
+# memoization primitive, so concurrent first-time accesses for the same `N`
+# cannot race to create distinct heap types.
+@cache
+def _get_cached_ubyte_array_type(num_bytes: int) -> type[ctypes.Array[ctypes.c_ubyte]]:
+    """Return a cached ``ctypes.c_ubyte * num_bytes`` array type.
+
+    Args:
+        num_bytes: The length of the array type in bytes.
+
+    Returns:
+        The cached ``ctypes.Array`` subclass for the given length. Subsequent
+        calls with the same ``num_bytes`` return the same type object.
+    """
+    return ctypes.c_ubyte * num_bytes
+
+
+# Helper functions for thread safety
+def synchronized(lock_attr_name):
+    """
+    Decorator to make a method thread-safe by acquiring the lock
+    specified by lock_attr_name on the instance.
+    """
+
+    def decorator(method):
+        @wraps(method)
+        def wrapper(self, *args, **kwargs):
+            lock = getattr(self, lock_attr_name)
+            with lock:
+                return method(self, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+@dataclass
+class FreeBlock:
+    """Metadata class used by the memory allocators"""
+
+    start: int
+    size: int
+
+    def can_be_coalesced(self, succ: "FreeBlock") -> bool:
+        return self.start + self.size == succ.start
+
+
+@dataclass
+class PinnedAllocFree:
+    """Resolved alloc/free function pair for pinned CPU memory."""
+
+    alloc_fn: Any
+    alloc_args: tuple
+    free_fn: Any
+    free_args: tuple
+
+    def alloc(self) -> int:
+        """Allocate pinned memory and return the raw pointer."""
+        return self.alloc_fn(*self.alloc_args)
+
+    def free(self, ptr: int) -> None:
+        """Free a previously allocated pinned-memory pointer."""
+        self.free_fn(ptr, *self.free_args)
+
+
+def _resolve_pinned_alloc_free(
+    numa_mapping: Optional[NUMAMapping] = None,
+    shm_name: Optional[str] = None,
+    size: Optional[int] = None,
+    use_hugepages: bool = False,
+) -> PinnedAllocFree:
+    """Resolve the alloc/free function pair based on memory type.
+
+    Returns:
+        A PinnedAllocFree with the resolved functions and their extra
+        arguments.  Call ``ptr = resolved.alloc()`` and ``resolved.free(ptr)``.
+    """
+    if shm_name:
+        if use_hugepages:
+            raise ValueError("Hugepages are not supported with shared memory (shm)")
+        return PinnedAllocFree(
+            alloc_fn=device_ops.alloc_shm_pinned_ptr,
+            alloc_args=(size, shm_name),
+            free_fn=device_ops.free_shm_pinned_ptr,
+            free_args=(size, shm_name),
+        )
+    elif numa_mapping:
+        if torch_dev.is_available():
+            current_device_id = torch_dev.current_device()
+        else:
+            current_device_id = 0
+        gpu_to_numa_mapping = numa_mapping.gpu_to_numa_mapping
+        assert current_device_id in gpu_to_numa_mapping, (
+            f"Current device {current_device_id} is not in the GPU NUMA mapping."
+        )
+        numa_id = gpu_to_numa_mapping[current_device_id]
+        if use_hugepages:
+            return PinnedAllocFree(
+                alloc_fn=device_ops.alloc_hugepage_pinned_numa_ptr,
+                alloc_args=(size, numa_id),
+                free_fn=device_ops.free_hugepage_pinned_numa_ptr,
+                free_args=(size,),
+            )
+        else:
+            return PinnedAllocFree(
+                alloc_fn=device_ops.alloc_pinned_numa_ptr,
+                alloc_args=(size, numa_id),
+                free_fn=device_ops.free_pinned_numa_ptr,
+                free_args=(size,),
+            )
+    else:
+        flags = 0
+        if use_hugepages:
+            return PinnedAllocFree(
+                alloc_fn=device_ops.alloc_hugepage_pinned_ptr,
+                alloc_args=(size, flags),
+                free_fn=device_ops.free_hugepage_pinned_ptr,
+                free_args=(size,),
+            )
+        else:
+            return PinnedAllocFree(
+                alloc_fn=device_ops.alloc_pinned_ptr,
+                alloc_args=(size, flags),
+                free_fn=device_ops.free_pinned_ptr,
+                free_args=(),
+            )
+
+
+def _read_hugepage_info() -> Optional[Tuple[int, int, int]]:
+    """Read hugepage pool stats from sysfs.
+
+    NOTE: We only use 2 MiB hugepages, so the pool stats are taken from
+    the 2 MiB pool directly rather than the system default pool reported in
+    ``/proc/meminfo`` (which can be 1 GiB on some hosts).
+
+    Returns:
+        ``(nr_hugepages, free_hugepages, page_size_mb)`` for the hugepage
+        pool, or ``None`` if the sysfs entries are unavailable.
+    """
+    base = "/sys/kernel/mm/hugepages/hugepages-2048kB"
+    try:
+        with open(f"{base}/nr_hugepages") as f:
+            total = int(f.read().strip())
+        with open(f"{base}/free_hugepages") as f:
+            free = int(f.read().strip())
+        return total, free, 2
+    except (OSError, ValueError):
+        return None
+
+
+def _allocate_cpu_memory(
+    size: int,
+    numa_mapping: Optional[NUMAMapping] = None,
+    shm_name: Optional[str] = None,
+    use_hugepages: bool = False,
+) -> torch.Tensor:
+    if size == 0:
+        return torch.empty(0, dtype=torch.uint8)
+
+    resolved = _resolve_pinned_alloc_free(
+        numa_mapping,
+        shm_name,
+        size,
+        use_hugepages,
+    )
+
+    try:
+        ptr = resolved.alloc()
+    except RuntimeError as e:
+        if use_hugepages and "mmap failed" in str(e):
+            diag = _read_hugepage_info()
+            if diag is not None:
+                total, free, page_mb = diag
+                page_bytes = page_mb * 1024 * 1024
+                needed = (size + page_bytes - 1) // page_bytes
+                logger.error(
+                    "Failed to allocate huge pages. "
+                    "Pool has %d pages (%d free, each %d MiB). "
+                    "Requested %d bytes (%d pages). "
+                    "Please grow the %d MiB hugepage pool.",
+                    total,
+                    free,
+                    page_mb,
+                    size,
+                    needed,
+                    page_mb,
+                )
+            else:
+                logger.error(
+                    "Failed to allocate huge pages. "
+                    "Please grow the 2 MiB hugepage pool."
+                )
+        raise
+
+    array_type = ctypes.c_uint8 * size
+    buf = array_type.from_address(ptr)
+    buffer = torch.frombuffer(buf, dtype=torch.uint8)
+
+    return buffer
+
+
+def _free_cpu_memory(
+    buffer: torch.Tensor,
+    size: int | None = None,
+    numa_mapping: Optional[NUMAMapping] = None,
+    shm_name: Optional[str] = None,
+    use_hugepages: bool = False,
+) -> None:
+    if torch_dev.is_available():
+        torch_dev.synchronize()
+
+    resolved = _resolve_pinned_alloc_free(
+        numa_mapping,
+        shm_name,
+        size,
+        use_hugepages,
+    )
+    resolved.free(buffer.data_ptr())
+
+
+def _allocate_gpu_memory(
+    size: int,
+    device: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    page_size = os.sysconf("SC_PAGESIZE")
+
+    # Over-allocate
+    base_buffer = torch.empty(size + page_size, dtype=torch.uint8, device=device)
+    offset = -base_buffer.data_ptr() % page_size
+
+    # Make aligned view
+    aligned_buffer = base_buffer[offset : offset + size]
+
+    # Need to return the base buffer as well in order to prevent GC
+    return base_buffer, aligned_buffer
+
+
+class TensorMemoryObj(MemoryObj):
+    """
+    Wraps a raw flat tensor with some metadata
+    """
+
+    def __init__(
+        self,
+        raw_data: torch.Tensor,
+        metadata: MemoryObjMetadata,
+        parent_allocator: Optional["MemoryAllocatorInterface"],
+    ):
+        assert metadata.dtype is not None, "dtype must be specified for TensorMemoryObj"
+        super().__init__(metadata)
+        self.raw_data = raw_data
+        self.valid = True
+        self.lock = threading.Lock()
+        self.parent_allocator = parent_allocator
+        # ``None`` means "use the layout-derived size from
+        # group_prefix_sum"; a non-None value narrows the logical view to
+        # exactly that many bytes (see set_used_size).  Allocator reuse
+        # paths must reset this to None along with the rest of the
+        # per-allocation metadata.
+        self._used_size_override: Optional[int] = None
+        # Calculate the prefix sum of the group sizes
+        # If there are two groups, the prefix sum will be
+        # [0, size_of_group_1, size_of_group_1 + size_of_group_2]
+        self.group_prefix_sum = [0]
+        if self.meta.shapes is not None and self.meta.dtypes is not None:
+            size_in_bytes = 0
+            for shape, dtype in zip(self.meta.shapes, self.meta.dtypes, strict=True):
+                size_in_bytes += shape.numel() * dtype.itemsize
+                self.group_prefix_sum.append(size_in_bytes)
+        else:
+            self.group_prefix_sum.append(self.meta.get_size())
+
+    def __del__(self):
+        """
+        Destructor to ensure memory is released when the object is garbage collected.
+        This acts as a safety net to prevent memory leaks if ref_count_down() is not
+        called properly somewhere in the code path.
+        """
+        if self.parent_allocator is not None and self.is_valid():
+            if self.meta.ref_count > 0 or self.meta.pin_count > 0:
+                logger.warning(
+                    "MemoryObj at %s is being garbage collected "
+                    "with ref_count=%d, pin_count=%d. "
+                    "This indicates ref_count_down()/unpin() was not called properly.",
+                    self.meta.address,
+                    self.meta.ref_count,
+                    self.meta.pin_count,
+                )
+            self.parent_allocator.free(self)
+
+    def invalidate(self):
+        self.valid = False
+
+    def is_valid(self):
+        return self.valid
+
+    def get_size(self) -> int:
+        if self._used_size_override is not None:
+            return self._used_size_override
+        return self.group_prefix_sum[-1]
+
+    def set_used_size(self, n: int) -> None:
+        """Narrow the logical size to ``n`` bytes after a write.
+
+        After this call, ``get_size()`` returns ``n`` and ``byte_array``
+        exposes exactly ``n`` bytes from the start of ``raw_data``.  The
+        physical allocation (``get_physical_size``) and ``raw_data``
+        buffer are unchanged.  Allocator reuse resets this override to
+        ``None`` so a recycled block returns to its layout-derived size.
+
+        Note: the ``tensor`` property still derives its shape from
+        ``meta.shape``, so accessing ``.tensor`` on a buffer narrowed
+        below its layout size will fail to reshape.  Use ``byte_array``
+        (or read ``raw_data[: get_size()]`` directly) for downstream
+        I/O that must honor the narrowed size.
+
+        Args:
+            n: bytes actually written.  Must satisfy
+                ``0 <= n <= get_physical_size()``.
+
+        Raises:
+            ValueError: if ``n`` is outside the allowed range.
+        """
+        if n < 0 or n > self.meta.phy_size:
+            raise ValueError(
+                f"set_used_size: n={n} out of range [0, {self.meta.phy_size}]"
+            )
+        with self.lock:
+            self._used_size_override = n
+
+    # TODO(chunxiaozheng): use get_shapes and get_dtypes to replace
+    #  get_shape and get_dtype
+    def get_shape(self) -> torch.Size:
+        return self.meta.shape
+
+    def get_dtype(self) -> torch.dtype:
+        assert self.meta.dtype is not None
+        return self.meta.dtype
+
+    def get_shapes(self) -> list[torch.Size]:
+        assert self.meta.shapes is not None
+        return self.meta.shapes
+
+    def get_dtypes(self) -> list[torch.dtype]:
+        assert self.meta.dtypes is not None
+        return self.meta.dtypes
+
+    def get_memory_format(self) -> MemoryFormat:
+        with self.lock:
+            return self.meta.fmt
+
+    def get_physical_size(self) -> int:
+        return self.meta.phy_size
+
+    def ref_count_up(self):
+        with self.lock:
+            self.meta.ref_count += 1
+
+    def ref_count_down(self):
+        with self.lock:
+            self.meta.ref_count -= 1
+            if self.meta.ref_count < 0:
+                logger.warning(
+                    "Ref count of MemoryObj %s"
+                    "is negative: %s."
+                    "Double free occurred somewhere."
+                    "Setting ref count back to 0 as a hack but please find the bug.",
+                    self.meta.address,
+                    self.meta.ref_count,
+                )
+                self.meta.ref_count = 0
+            if (
+                self.meta.ref_count == 0
+                and self.parent_allocator is not None
+                and self.meta.pin_count == 0
+            ):
+                self.parent_allocator.free(self)
+
+    def get_ref_count(self) -> int:
+        with self.lock:
+            return self.meta.ref_count
+
+    def get_num_tokens(self) -> int:
+        with self.lock:
+            token_dim = self.meta.fmt.token_dim()
+            return self.meta.shape[token_dim]
+
+    def pin(self) -> bool:
+        with self.lock:
+            self.meta.pin_count += 1
+            return True
+
+    def unpin(self) -> bool:
+        with self.lock:
+            self.meta.pin_count -= 1
+
+            if self.meta.pin_count <= 0 and self.meta.ref_count <= 0:
+                if self.parent_allocator is None:
+                    logger.error(
+                        "Parent allocator is None when trying to free MemoryObj."
+                        "This could cause memory leak"
+                    )
+                else:
+                    self.parent_allocator.free(self)
+
+            if self.meta.pin_count < 0:
+                logger.warning(
+                    "Pin count of MemoryObj %s"
+                    "is negative: %s."
+                    "Double unpin occurred somewhere."
+                    "Setting pin count back to 0 as a hack but please find the bug.",
+                    self.meta.address,
+                    self.meta.pin_count,
+                )
+                self.meta.pin_count = 0
+            return True
+
+    @property
+    def metadata(self) -> MemoryObjMetadata:
+        with self.lock:
+            return self.meta
+
+    @property
+    def tensor(self) -> Optional[torch.Tensor]:
+        if not self.valid:
+            logger.warning("Trying to access an invalidated MemoryObj")
+            return None
+        assert self.meta.dtype is not None
+        if self._used_size_override is not None:
+            # Narrowed byte buffer (see set_used_size): expose exactly
+            # the used bytes as a flat uint8 view.  Reshaping to the
+            # original meta.shape would raise -- fewer than shape-many
+            # bytes are logically present -- so keep the view consistent
+            # with get_size()/byte_array/shm_byte_length, which all
+            # report the narrowed length.  Consumers that build SHM
+            # transport slots from ``tensor.shape`` and
+            # ``shm_byte_length`` then stay self-consistent.
+            return self.raw_data[: self._used_size_override].view(torch.uint8)
+        # TODO(Jiayi): consider caching the `get_size()`
+        return (
+            self.raw_data[: self.get_size()].view(self.meta.dtype).view(self.meta.shape)
+        )
+
+    @property
+    def byte_array(self) -> memoryview:
+        # TODO: consider using one of the alternatives
+
+        # Alternative 1:
+        # # PyTorch tensors support buffer protocol directly for CPU tensors
+        # return memoryview(self.raw_data)
+
+        # Alternative 2:
+        # assert self.raw_data.device.type == 'cpu',
+        #   "byte_array only works with CPU tensors"
+        # return memoryview(self.raw_data.contiguous().numpy())
+
+        # Use logical size (get_size) rather than raw_data physical size.
+        # The raw_data buffer may include alignment padding (e.g. from
+        # batched_allocate) that must not be exposed to callers such as
+        # remote-backend put/get which rely on byte_array length matching
+        # the metadata length.
+        num_bytes = self.get_size()
+        ptr = self.raw_data.data_ptr()
+        # ctypes does not cache (c_ubyte * N) array types -- each `*` builds a
+        # fresh heap type. With this property accessed once per remote put/get,
+        # uncached creation leaks ~1-2 kB per call (heap-type metadata is held
+        # by the type system and never reclaimed). Cache the array type per
+        # size so steady-state usage reuses a fixed set of types. See
+        # https://github.com/LMCache/LMCache/issues/3767.
+        arr_type = _get_cached_ubyte_array_type(num_bytes)
+        ubyte_ptr = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_ubyte))
+        byte_array = arr_type.from_address(ctypes.addressof(ubyte_ptr.contents))
+        return memoryview(byte_array)
+
+    @property
+    def data_ptr(self) -> int:
+        return self.raw_data.data_ptr()
+
+    @property
+    def is_pinned(self) -> bool:
+        return self.metadata.pin_count > 0
+
+    @property
+    def can_evict(self) -> bool:
+        """
+        Check whether the memory obj can be evicted.
+        A memory obj can be evicted if it is not pinned and ref_count=1.
+        """
+        return not self.is_pinned and self.get_ref_count() == 1
+
+    @property
+    def raw_tensor(self) -> Optional[torch.Tensor]:
+        if not self.valid:
+            logger.warning("Trying to access an invalidated MemoryObj")
+            return None
+        return self.raw_data
+
+    def get_tensor(self, index: int) -> Optional[torch.Tensor]:
+        if not self.valid:
+            logger.warning("Trying to access an invalidated MemoryObj")
+            return None
+        assert self.meta.shapes is not None
+        assert self.meta.dtypes is not None
+        begin = self.group_prefix_sum[index]
+        end = self.group_prefix_sum[index + 1]
+        return (
+            self.raw_data[begin:end]
+            .view(self.meta.dtypes[index])
+            .view(self.meta.shapes[index])
+        )
+
+    def parent(self) -> Optional["MemoryAllocatorInterface"]:
+        return self.parent_allocator
+
+
+class BytesBufferMemoryObj(MemoryObj):
+    """
+    Wraps a raw flat tensor with some metadata
+    """
+
+    def __init__(self, raw_bytes: bytes, metadata: Optional[MemoryObjMetadata] = None):
+        self.raw_data = raw_bytes
+        if metadata is None:
+            bytes_shape = torch.Size([len(self.raw_data), 0, 0, 0])
+            metadata = MemoryObjMetadata(
+                shape=bytes_shape,
+                dtype=None,
+                address=0,
+                phy_size=0,
+                ref_count=1,
+                pin_count=0,
+                fmt=MemoryFormat.BINARY_BUFFER,
+            )
+        super().__init__(metadata)
+        self.valid = True
+
+    def invalidate(self):
+        self.valid = False
+
+    def is_valid(self):
+        return self.valid
+
+    def get_size(self) -> int:
+        return len(self.raw_data)
+
+    def get_shape(self) -> torch.Size:
+        return torch.Size([len(self.raw_data), 0, 0, 0])
+
+    def get_dtype(self) -> Optional[torch.dtype]:
+        return None
+
+    def get_shapes(self) -> list[torch.Size]:
+        return [self.get_shape()]
+
+    def get_dtypes(self) -> list[torch.dtype]:
+        return [self.get_dtype()]  # type: ignore[list-item]
+
+    def get_memory_format(self) -> MemoryFormat:
+        return self.metadata.fmt
+
+    def get_physical_size(self) -> int:
+        return self.metadata.phy_size
+
+    def pin(self) -> bool:
+        self.metadata.pin_count += 1
+        return True
+
+    def unpin(self) -> bool:
+        self.metadata.pin_count -= 1
+        if self.metadata.pin_count < 0:
+            logger.warning(
+                "Pin count of MemoryObj %s"
+                "is negative: %s."
+                "Double unpin occurred somewhere."
+                "Setting pin count back to 0 as a hack but please find the bug.",
+                self.meta.address,
+                self.meta.pin_count,
+            )
+            self.metadata.pin_count = 0
+        return True
+
+    def ref_count_up(self):
+        pass
+
+    def ref_count_down(self):
+        pass
+
+    def get_ref_count(self) -> int:
+        return 1
+
+    def get_num_tokens(self) -> int:
+        # TODO(Jiayi): record the number of tokens somehow
+        return 1
+
+    @property
+    def metadata(self) -> MemoryObjMetadata:
+        return self.meta
+
+    @property
+    def tensor(self) -> Optional[torch.Tensor]:
+        if not self.valid:
+            logger.warning("Trying to access an invalidated MemoryObj")
+            return None
+        return None
+
+    @property
+    def byte_array(self) -> bytes:
+        return self.raw_data
+
+    @property
+    def data_ptr(self) -> int:
+        mv = memoryview(self.raw_data)
+        addr = ctypes.addressof(ctypes.c_char.from_buffer(mv))
+        return addr
+
+    @property
+    def is_pinned(self) -> bool:
+        return self.metadata.pin_count > 0
+
+    @property
+    def can_evict(self) -> bool:
+        """
+        Check whether the memory obj can be evicted.
+        A buffer memory obj can be evicted if it is not pinned.
+        """
+        return not self.is_pinned
+
+    @property
+    def raw_tensor(self) -> Optional[torch.Tensor]:
+        if not self.valid:
+            logger.warning("Trying to access an invalidated MemoryObj")
+            return None
+        return None
+
+    def get_tensor(self, index: int) -> Optional[torch.Tensor]:
+        return None
+
+    def parent(self) -> Optional["MemoryAllocatorInterface"]:
+        # NOTE: BytesBufferMemoryObj may not be allocated by any allocator,
+        # so just return None here
+        return None
+
+
+class GDSMemoryObject(MemoryObj):
+    """A slab-anchored ``MemoryObj`` for the GDS L1 tier.
+
+    The bytes live in the GDS slab file, not in host or device memory, so
+    this object carries only the slab ``(offset, size)`` (in ``meta.address``
+    / ``meta.phy_size``) and is otherwise a placeholder: ``tensor`` is always
+    ``None`` and ``byte_array`` / ``data_ptr`` raise.
+    """
+
+    def __init__(self, metadata: MemoryObjMetadata) -> None:
+        super().__init__(metadata)
+        self.valid = True
+
+    @property
+    def slab_offset(self) -> int:
+        """Byte offset of this chunk within the slab file (== ``meta.address``)."""
+        return self.meta.address
+
+    def invalidate(self) -> None:
+        self.valid = False
+
+    def is_valid(self) -> bool:
+        return self.valid
+
+    def get_size(self) -> int:
+        return self.meta.get_size()
+
+    def get_shape(self) -> torch.Size:
+        return self.meta.shape
+
+    def get_dtype(self) -> Optional[torch.dtype]:
+        return self.meta.dtype
+
+    def get_shapes(self) -> list[torch.Size]:
+        return (
+            list(self.meta.shapes)
+            if self.meta.shapes is not None
+            else [self.meta.shape]
+        )
+
+    def get_dtypes(self) -> list[torch.dtype]:
+        if self.meta.dtypes is not None:
+            return list(self.meta.dtypes)
+        if self.meta.dtype is None:
+            raise ValueError("GDS object has no dtype")
+        return [self.meta.dtype]
+
+    def get_memory_format(self) -> MemoryFormat:
+        return self.meta.fmt
+
+    def get_physical_size(self) -> int:
+        return self.meta.phy_size
+
+    def ref_count_up(self) -> None:
+        raise NotImplementedError(
+            "GDSMemoryObject.ref_count_up: not used on the GDS path"
+        )
+
+    def ref_count_down(self) -> None:
+        raise NotImplementedError(
+            "GDSMemoryObject.ref_count_down: not used on the GDS path"
+        )
+
+    def get_ref_count(self) -> int:
+        raise NotImplementedError(
+            "GDSMemoryObject.get_ref_count: not used on the GDS path"
+        )
+
+    def get_num_tokens(self) -> int:
+        raise NotImplementedError(
+            "GDSMemoryObject.get_num_tokens: not used on the GDS path"
+        )
+
+    def pin(self) -> bool:
+        raise NotImplementedError("GDSMemoryObject.pin: not used on the GDS path")
+
+    def unpin(self) -> bool:
+        raise NotImplementedError("GDSMemoryObject.unpin: not used on the GDS path")
+
+    @property
+    def metadata(self) -> MemoryObjMetadata:
+        return self.meta
+
+    @property
+    def tensor(self) -> Optional[torch.Tensor]:
+        return None
+
+    @property
+    def byte_array(self) -> bytes:
+        raise NotImplementedError(
+            f"GDSMemoryObject(slab_offset={self.slab_offset}).byte_array is not "
+            "supported; bytes live in the GDS slab file and the staging buffer "
+            "is registered VRAM (no buffer protocol)."
+        )
+
+    @property
+    def data_ptr(self) -> int:
+        raise NotImplementedError(
+            f"GDSMemoryObject(slab_offset={self.slab_offset}).data_ptr is not "
+            "supported; GDS reads/writes use gpu_buffer.data_ptr() via the "
+            "gpu_ops dispatch, never the MemoryObj's data_ptr."
+        )
+
+    @property
+    def is_pinned(self) -> bool:
+        raise NotImplementedError("GDSMemoryObject.is_pinned: not used on the GDS path")
+
+    @property
+    def can_evict(self) -> bool:
+        raise NotImplementedError("GDSMemoryObject.can_evict: not used on the GDS path")
+
+    @property
+    def raw_tensor(self) -> Optional[torch.Tensor]:
+        return None
+
+    def get_tensor(self, index: int) -> Optional[torch.Tensor]:
+        return None
+
+    def parent(self) -> Optional["MemoryAllocatorInterface"]:
+        # The GDS slab is not a MemoryAllocatorInterface; dispatch in gpu_ops
+        # keys off the GDSMemoryObject type, not the parent allocator.
+        return None
+
+
+Lease = tuple[Callable[[], bool], Callable[[], None]]
+"""``(lease_is_valid, on_release)``: a nonblocking check that the lease still
+holds, and the idempotent, nonblocking call that ends it. ``on_release`` runs
+under the L1 manager's lock on whichever thread frees the object, so it must
+never call back into an L1 manager and may only submit the owner's unlock."""
+
+
+class PendingRead(Protocol):
+    """A read a remote borrower started into a local device region."""
+
+    def is_finished(self) -> bool:
+        """Return whether the read stopped, successfully or not."""
+        ...
+
+    def succeeded(self) -> bool:
+        """Return whether the bytes arrived; only meaningful once finished."""
+        ...
+
+
+class BorrowedMemoryObj(MemoryObj):
+    """An object whose bytes a peer owns, held under a lease; no local tensor.
+
+    :class:`ShadowL1MemoryManager` creates it as a placeholder: layout
+    metadata, no bytes, no lease. A borrower's load :meth:`bind`\\ s it to a
+    lease and to a ``read_into`` that reads the bytes into a registered local
+    device region at retrieve time. The tensor accessors report no local
+    bytes. ``is_valid()`` is False before binding, after :meth:`release`, and
+    once the lease ended.
+    """
+
+    def __init__(self, metadata: MemoryObjMetadata) -> None:
+        super().__init__(metadata)
+        self.valid = True
+        self._lock = threading.Lock()
+        self._lease: Lease | None = None
+        self._read_into: Callable[[int, int], PendingRead] | None = None
+        self._source = ""
+
+    @property
+    def is_bound(self) -> bool:
+        """Whether a borrower bound a lease and a read to this object."""
+        return self._lease is not None
+
+    @property
+    def is_remote(self) -> bool:
+        """Whether the object reads its bytes into a device region; True once
+        bound."""
+        return self._read_into is not None
+
+    def bind(
+        self,
+        lease: Lease,
+        *,
+        read_into: Callable[[int, int], PendingRead],
+        address: int,
+        source: str,
+    ) -> None:
+        """Bind the placeholder to its lease and bytes; once per object.
+
+        Args:
+            lease: The owner's reservation.
+            read_into: ``(region_id, offset) -> PendingRead`` starting a read
+                of the bytes into a registered device region.
+            address: The owner's address of the bytes.
+            source: The owner, e.g. its transfer URL. One shadow serves every
+                peer, so ``source`` and ``address`` together tell two views of
+                the same bytes from views of different bytes.
+
+        Raises:
+            RuntimeError: If the object is already bound.
+            ValueError: If ``address`` is negative or ``source`` is empty.
+        """
+        if self._lease is not None:
+            raise RuntimeError("BorrowedMemoryObj is already bound")
+        if address < 0 or not source:
+            raise ValueError("borrowed bytes need the owner's address and source")
+        self._read_into = read_into
+        self.meta.address = address
+        self._source = source
+        self._lease = lease
+
+    @property
+    def lease(self) -> Lease:
+        """Return the object's lease; RuntimeError if it is not bound."""
+        if self._lease is None:
+            raise RuntimeError("BorrowedMemoryObj is not bound")
+        return self._lease
+
+    def replace_lease(self, lease: Lease) -> None:
+        """Put the object under a newer lease of the same bytes; the caller
+        owns the previous one."""
+        self._lease = lease
+
+    def release(self) -> None:
+        """Invalidate the object and end its lease; repeated calls are no-ops."""
+        if not self.valid:
+            return
+        self.invalidate()
+        if self._lease is not None:
+            self._lease[1]()
+
+    def same_bytes(self, other: "BorrowedMemoryObj") -> bool:
+        """Return whether ``other`` is a view of the same bytes as this one."""
+        return (
+            self.is_bound
+            and other.is_bound
+            and (self._source, self.meta.address) == (other._source, other.meta.address)
+        )
+
+    def read_into(self, region_id: int, offset: int) -> PendingRead:
+        """Start reading the bytes into a registered local memory region.
+
+        Args:
+            region_id: Local region registered with the borrower's transport.
+            offset: Byte offset of the destination within that region.
+
+        Returns:
+            The in-flight read to poll; it fails instead of reading when the
+            lease has already ended.
+
+        Raises:
+            RuntimeError: If the object is not bound.
+        """
+        if self._read_into is None:
+            raise RuntimeError("BorrowedMemoryObj is not bound")
+        return self._read_into(region_id, offset)
+
+    # -- MemoryObj: layout and lifetime from the metadata --------------------
+
+    def invalidate(self) -> None:
+        """Mark the object unusable."""
+        self.valid = False
+
+    def is_valid(self) -> bool:
+        """Return whether the object is bound, unreleased and its lease holds."""
+        return bool(self.valid) and self._lease is not None and self._lease[0]()
+
+    def get_size(self) -> int:
+        """Return the logical size in bytes of the borrowed object."""
+        return self.meta.phy_size
+
+    def get_physical_size(self) -> int:
+        """Return the size in bytes; borrowed objects have no padding here."""
+        return self.meta.phy_size
+
+    def get_shape(self) -> torch.Size:
+        """Return the shape of the first object group."""
+        return self.meta.shape
+
+    def get_shapes(self) -> list[torch.Size]:
+        """Return the shape of every object group.
+
+        Raises:
+            RuntimeError: If the metadata lists no group shapes, which the
+                shadow L1's placeholders always set.
+        """
+        if self.meta.shapes is None:
+            raise RuntimeError("BorrowedMemoryObj metadata lists no shapes")
+        return self.meta.shapes
+
+    def get_dtypes(self) -> list[torch.dtype]:
+        """Return the dtype of every object group.
+
+        Raises:
+            RuntimeError: If the metadata lists no group dtypes, which the
+                shadow L1's placeholders always set.
+        """
+        if self.meta.dtypes is None:
+            raise RuntimeError("BorrowedMemoryObj metadata lists no dtypes")
+        return self.meta.dtypes
+
+    def get_memory_format(self) -> MemoryFormat:
+        """Return the layout format from the metadata."""
+        return self.meta.fmt
+
+    def get_num_tokens(self) -> int:
+        """Return the token count along the format's token dimension."""
+        return self.meta.shape[self.meta.fmt.token_dim()]
+
+    def pin(self) -> bool:
+        """Count a pin; the shadow L1 frees the object, not a pin count."""
+        with self._lock:
+            self.meta.pin_count += 1
+        return True
+
+    def unpin(self) -> bool:
+        """Drop a pin."""
+        with self._lock:
+            self.meta.pin_count = max(0, self.meta.pin_count - 1)
+        return True
+
+    def ref_count_up(self) -> None:
+        """Count a reference."""
+        with self._lock:
+            self.meta.ref_count += 1
+
+    def ref_count_down(self) -> None:
+        """Drop a reference; the shadow L1 frees the object, not a count."""
+        with self._lock:
+            self.meta.ref_count = max(0, self.meta.ref_count - 1)
+
+    def get_ref_count(self) -> int:
+        """Return the reference count."""
+        with self._lock:
+            return self.meta.ref_count
+
+    @property
+    def metadata(self) -> MemoryObjMetadata:
+        """Return the layout metadata."""
+        return self.meta
+
+    @property
+    def is_pinned(self) -> bool:
+        """Return whether the object is pinned."""
+        return self.meta.pin_count > 0
+
+    @property
+    def can_evict(self) -> bool:
+        """Return False: the owner evicts the bytes, the shadow L1 the view."""
+        return False
+
+    def parent(self) -> None:
+        """Return None: no local allocator backs a borrowed object."""
+        return None
+
+    # -- MemoryObj: no local bytes -------------------------------------------
+
+    @property
+    def tensor(self) -> None:
+        """Return None: the bytes are not in local memory."""
+        return None
+
+    @property
+    def raw_tensor(self) -> None:
+        """Return None: the bytes are not in local memory."""
+        return None
+
+    def get_tensor(self, index: int) -> None:
+        """Return None: the bytes are not in local memory."""
+        return None
+
+    @property
+    def byte_array(self) -> bytes:
+        """Raise: the bytes are not in local memory; use :meth:`read_into`.
+
+        Raises:
+            RuntimeError: Always.
+        """
+        raise RuntimeError("BorrowedMemoryObj has no local bytes; use read_into")
+
+    @property
+    def data_ptr(self) -> int:
+        """Raise: the bytes are not in local memory; use :meth:`read_into`.
+
+        Raises:
+            RuntimeError: Always.
+        """
+        raise RuntimeError("BorrowedMemoryObj has no local bytes; use read_into")
+
+
+class AddressManager:
+    """
+    Manages a virtual address space starting from 0 for memory allocation.
+
+    Key interfaces:
+    - allocate(size): Allocate a block of memory of the given size. The starting
+      address and the actual allocated size will be aligned.
+
+    - free(address, size): Free a previously allocated region. Note that if the
+      region is not "allocated" before, it may have internal errors.
+
+    - sbrk(size): Expand the virtual address space by the given size. The size
+      will be aligned internally.
+
+    Core assumptions:
+    - The allocated size should be aligned with ALIGN_BYTES.
+    """
+
+    ALIGN_BYTES = 4096
+
+    def __init__(self, size: int, align_bytes: int = ALIGN_BYTES):
+        """
+        Initializes the AddressManager with a given size.
+
+        Args:
+            size: The initial size of the virtual address space.
+            align_bytes: The alignment requirement for allocations.
+        """
+        self._size = size
+        self._align = align_bytes
+
+        # Current implementation: explicit list
+        self._explicit_list: SortedList[FreeBlock] = SortedList(key=lambda x: x.start)
+        self._explicit_list.add(FreeBlock(start=0, size=size))
+
+        # thread safe lock
+        self._lock = threading.Lock()
+
+        # For debugging purposes
+        self.total_allocated_size = 0
+
+    def compute_aligned_size(self, raw_size: int) -> int:
+        """
+        Helper function to compute the aligned size for a given raw size.
+
+        Args:
+            raw_size: The raw size to be aligned.
+
+        Returns:
+            The aligned size.
+        """
+        return (raw_size + self._align - 1) & ~(self._align - 1)
+
+    def _can_merge_with_prev(
+        self, curr_block: FreeBlock, prev_block: FreeBlock
+    ) -> bool:
+        """Hook: Check if curr_block can merge with prev_block."""
+        return prev_block.can_be_coalesced(curr_block)
+
+    def _can_merge_with_succ(
+        self, curr_block: FreeBlock, succ_block: FreeBlock
+    ) -> bool:
+        """Hook: Check if curr_block can merge with succ_block."""
+        return curr_block.can_be_coalesced(succ_block)
+
+    @_lmcache_nvtx_annotate
+    def _coalesce(
+        self,
+        curr_block: FreeBlock,
+        prev_block: Optional[FreeBlock],
+        succ_block: Optional[FreeBlock],
+    ):
+        """
+        Coalesces the current block with the previous and/or successor block.
+        This assumes the curr_block is NOT in self._explicit_list
+
+        Returns True if the current block was coalesced, otherwise False.
+        """
+        merge_prev = prev_block is not None and self._can_merge_with_prev(
+            curr_block, prev_block
+        )
+        merge_succ = succ_block is not None and self._can_merge_with_succ(
+            curr_block, succ_block
+        )
+
+        if merge_prev and merge_succ:
+            prev_block.size += curr_block.size + succ_block.size  # type: ignore
+            self._explicit_list.remove(succ_block)
+        elif merge_prev:
+            prev_block.size += curr_block.size  # type: ignore
+        elif merge_succ:
+            # NOTE: logically, this won't change the order of the succ_block,
+            #       so we don't need to do a "remove" and "reinsert" here
+            self._explicit_list.remove(succ_block)
+            succ_block.start -= curr_block.size  # type: ignore
+            succ_block.size += curr_block.size  # type: ignore
+            self._explicit_list.add(succ_block)
+
+        return merge_prev or merge_succ
+
+    @_lmcache_nvtx_annotate
+    @synchronized("_lock")
+    def allocate(self, size: int) -> tuple[int, int]:
+        """
+        Allocate a block of memory from the virtual address space of a given
+        size. The actual allocated size could be larger than the requested size
+        in order to satisfy alignment requirements.
+
+        Args:
+            size: The requested size of the memory block. Should be greater
+                than 0.
+
+        Returns:
+            A tuple (address, allocated_size) where address is the starting
+            address of the allocated block and allocated_size is the actual
+            size of the allocated block.
+
+        Raises:
+            ValueError: If size is not positive. This is a caller bug, not an
+                out-of-memory condition, and must not be signalled as one: the
+                allocation stack treats a failed request as memory pressure and
+                reacts by evicting cached objects or retrying in a busy loop.
+            RuntimeError: If no memory is available to allocate.
+        """
+        if size <= 0:
+            raise ValueError("size must be greater than 0")
+
+        aligned_size = self.compute_aligned_size(size)
+        for block in self._explicit_list:
+            if block.size >= aligned_size:
+                break
+        else:
+            logger.warning(
+                "Failed to allocate memory block of size %d "
+                "because no memory is available",
+                size,
+            )
+            raise RuntimeError(
+                f"Failed to allocate memory block of size {size} "
+                "because no memory is available"
+            )
+
+        self._explicit_list.remove(block)
+        if block.size > aligned_size:
+            self._explicit_list.add(
+                FreeBlock(
+                    start=block.start + aligned_size,
+                    size=block.size - aligned_size,
+                )
+            )
+
+        # For debug
+        self.total_allocated_size += aligned_size
+
+        return block.start, aligned_size
+
+    @_lmcache_nvtx_annotate
+    @synchronized("_lock")
+    def batched_allocate(self, size: int, batch_size: int) -> list[tuple[int, int]]:
+        """
+        Allocate blocks of memory from the virtual address space of a given
+        size and batch size. The actual allocated size could be larger than
+        the requested size in order to satisfy alignment requirements.
+
+        Args:
+            size: The requested size of the memory block. Should be greater
+                than 0.
+            batch_size: The number of memory blocks to allocate. Must be
+                non-negative; zero returns an empty list.
+
+        Returns:
+            A list of tuple (address, allocated_size) where address is the starting
+            address of the allocated block and allocated_size is the actual size of
+            the allocated block.
+            Note: the length of the return list is the same as the batch_size.
+
+        Raises:
+            ValueError: If size is not positive. See ``allocate`` for why this is
+                not reported as ``RuntimeError``.
+            RuntimeError: If batch_size is negative or no memory is available
+                to allocate.
+        """
+        if size <= 0:
+            raise ValueError("size must be greater than 0")
+
+        if batch_size < 0:
+            raise RuntimeError("batch_size must be non-negative")
+
+        aligned_size = self.compute_aligned_size(size)
+        remaining = batch_size
+        allocate_result: list[tuple[int, int]] = []
+
+        blocks_to_remove: list[FreeBlock] = []
+        blocks_to_add: list[FreeBlock] = []
+
+        for block in self._explicit_list:
+            if remaining <= 0:
+                break
+            if block.size < aligned_size:
+                continue
+
+            # Greedily carve out as many aligned_size chunks as possible
+            num_from_block = min(remaining, block.size // aligned_size)
+            start = block.start
+            for i in range(num_from_block):
+                allocate_result.append((start + i * aligned_size, aligned_size))
+            remaining -= num_from_block
+
+            # Mark the original block for removal
+            blocks_to_remove.append(block)
+
+            # Keep the remaining tail as a new free block if any space is left
+            used = num_from_block * aligned_size
+            if block.size > used:
+                blocks_to_add.append(
+                    FreeBlock(start=block.start + used, size=block.size - used)
+                )
+
+        if remaining > 0:
+            # Not enough memory; free list is untouched, no rollback needed
+            logger.warning(
+                "Failed to batched allocate %d memory blocks of size %d "
+                "because no enough memory is available (short by %d blocks)",
+                batch_size,
+                size,
+                remaining,
+            )
+            raise RuntimeError(
+                f"Failed to batched allocate {batch_size} memory blocks "
+                f"of size {size} because no enough memory is available"
+            )
+
+        # Allocation succeeded; batch-update the free list
+        for block in blocks_to_remove:
+            self._explicit_list.remove(block)
+        for block in blocks_to_add:
+            self._explicit_list.add(block)
+
+        # Update debug statistics
+        total_allocated = aligned_size * batch_size
+        self.total_allocated_size += total_allocated
+
+        return allocate_result
+
+    @_lmcache_nvtx_annotate
+    @synchronized("_lock")
+    def free(self, address: int, size: int):
+        """
+        Free a previously allocated block of memory.
+
+        Args:
+            address: The starting address of the block to free.
+            size: The size of the block to free. Should be greater than 0.
+        """
+        new_free_block = FreeBlock(start=address, size=size)
+        index = self._explicit_list.bisect_left(new_free_block)
+        prev_block = self._explicit_list[index - 1] if index > 0 else None
+        succ_block = (
+            self._explicit_list[index] if index < len(self._explicit_list) else None
+        )
+
+        coalesced = self._coalesce(new_free_block, prev_block, succ_block)
+        if not coalesced:
+            self._explicit_list.add(new_free_block)
+
+        # For debug
+        self.total_allocated_size -= size
+
+    @synchronized("_lock")
+    def sbrk(self, size: int):
+        """
+        Expand the virtual address space by a given size.
+
+        Args:
+            size: The size to expand the address space. Will be aligned internally
+                with the ALIGN_BYTES
+        """
+        size = self.compute_aligned_size(size)
+        new_block = FreeBlock(start=self._size, size=size)
+        prev_block = self._explicit_list[-1] if len(self._explicit_list) > 0 else None
+        succ_block = None
+        coalesced = self._coalesce(new_block, prev_block, succ_block)
+        if not coalesced:
+            self._explicit_list.add(new_block)
+
+        self._size += size
+
+    def get_heap_size(self) -> int:
+        """
+        Get the total size of the address space.
+
+        Returns:
+            The total size in bytes.
+        """
+        return self._size
+
+    def get_free_size(self) -> int:
+        """
+        Get the total free size in the address space.
+
+        Returns:
+            The total free size in bytes.
+        """
+        return self._size - self.total_allocated_size
+
+    def check_consistency(self) -> bool:
+        """
+        Check if the address manager is consistent.
+
+        Returns:
+            True if consistent, False otherwise.
+        """
+        # Check if free blocks are properly coalesced
+        for prev, succ in zip(
+            self._explicit_list[:-1], self._explicit_list[1:], strict=False
+        ):
+            if prev.can_be_coalesced(succ):
+                return False
+
+        # Check if total size matches
+        total_free_size = sum(block.size for block in self._explicit_list)
+        if total_free_size + self.total_allocated_size != self._size:
+            return False
+
+        return True
+
+
+_CORE_EXPORTS = [
+    "AddressManager",
+    "BorrowedMemoryObj",
+    "BytesBufferMemoryObj",
+    "FreeBlock",
+    "GDSMemoryObject",
+    "Lease",
+    "MemoryAllocatorInterface",
+    "MemoryFormat",
+    "MemoryObj",
+    "MemoryObjMetadata",
+    "PendingRead",
+    "TensorMemoryObj",
+    "torch_device_type",
+]
+
+__all__ = list(_CORE_EXPORTS)

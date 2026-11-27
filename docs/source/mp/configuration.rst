@@ -1,0 +1,1431 @@
+Configuration Reference
+=======================
+
+This page documents every CLI argument accepted by the LMCache multiprocess
+server.  Arguments are grouped by the config module that defines them.
+
+.. contents::
+   :local:
+   :depth: 2
+
+Per-request LMCache configuration
+---------------------------------
+
+vLLM clients can attach request-scoped LMCache metadata through the top-level
+``kv_transfer_params`` field.  When vLLM uses ``LMCacheMPConnector``, entries
+whose keys start with ``lmcache.`` are forwarded with the request across the
+MP scheduler and worker IPC paths.  Other ``kv_transfer_params`` entries are
+reserved for the transfer layer and are not forwarded to LMCache.
+
+For example:
+
+.. code-block:: bash
+
+   curl -X POST http://localhost:8000/v1/completions \
+       -H "Content-Type: application/json" \
+       -d '{
+           "model": "Qwen/Qwen3-14B",
+           "prompt": "Explain KV cache reuse.",
+           "max_tokens": 32,
+           "kv_transfer_params": {
+               "lmcache.tag.tenant": "example-tenant",
+               "lmcache.ttl": 60
+           }
+       }'
+
+The connector carries these values on lookup, prefetch, store, retrieve, and
+lookup-lock cleanup operations so server-side features can inspect the same
+request metadata throughout the request lifecycle.
+
+.. important::
+
+   Forwarding a value does not by itself make the MP server act on it.  The
+   MP server makes ``lmcache.tag.*`` entries part of cache identity (the
+   vLLM connector uses this for `LoRA adapters`_) and treats the other
+   request configs as metadata.  Do not rely on ``lmcache.ttl``,
+   ``lmcache.skip_save``, or another request config for expiration or
+   cache-control behavior in MP mode unless the selected server-side feature
+   feature explicitly documents support for it.
+
+The MP server's default ``--kv-load-policy`` acts on ``lmcache.skip_load``: a
+request that sets it to ``true`` gets a lookup miss and is recomputed by the
+engine.  Load policies receive the request configs as sent.  The vLLM
+``LMCacheMPConnector``, the unified SGLang MP connector, and the TensorRT-LLM MP
+adapter add ``lmcache.hint.engine_computed_tokens``, the tokens the engine
+already holds in its own prefix cache, to their lookups.  vLLM omits it on
+eager-prefetch lookups, which run before vLLM checks its prefix cache.
+
+MP Server
+---------
+
+Source: ``lmcache/v1/multiprocess/config.py``
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 55
+
+   * - Argument
+     - Default
+     - Description
+   * - ``--transport``
+     - ``grpc``
+     - Request transport exposed by the server. Choices: ``grpc`` or ``zmq``.
+       ``zmq`` is deprecated and will be removed in a future release; see
+       :ref:`mp-migrating-from-zmq`.
+   * - ``--instance-id``
+     - *(unset, default UUID v4)*
+     - Stable identity of this MP server. Used as the coordinator
+       membership key and projected onto the OTel
+       ``service.instance.id`` resource attribute on every metric and
+       span (so telemetry and coordinator membership share one id).
+       When the flag is not passed, defaults to a random UUID v4
+       minted at startup.
+   * - ``--host``
+     - ``localhost``
+     - Host address to bind the selected request server.
+   * - ``--port``
+     - ``5555``
+     - Port to bind the selected request server.
+   * - ``--chunk-size``
+     - ``256``
+     - Minimum chunk size for KV cache operations (in tokens). MP engine
+       connectors may resolve a larger model-specific effective size to satisfy
+       the engine's KV geometry; see :doc:`chunk_size_negotiation`.
+   * - ``--null-block-id``
+     - ``0``
+     - Engine block ID that denotes absent KV data. Keep the default for
+       vLLM-compatible layouts. Engines where block ``0`` is valid, such as
+       ATOM native PAGE/STATE transfer, can use ``-1``.
+   * - ``--max-workers``
+     - ``1``
+     - Base number of worker threads. Sets the default for both the GPU
+       (affinity) pool and the CPU (normal) pool. Can be overridden
+       per-pool with ``--max-gpu-workers`` and ``--max-cpu-workers``.
+   * - ``--max-gpu-workers``
+     - (inherits ``--max-workers``)
+     - Worker threads for the GPU affinity pool (STORE/RETRIEVE).
+       Requests from the same vLLM instance are always dispatched to the
+       same thread, eliminating GPU transfer lock contention.
+   * - ``--max-cpu-workers``
+     - (inherits ``--max-workers``)
+     - Worker threads for the normal CPU pool (LOOKUP, etc.).
+   * - ``--grpc-server-workers``
+     - ``32``
+     - gRPC request-dispatch threads. Used only with ``--transport grpc``.
+   * - ``--grpc-server-mode``
+     - ``auto``
+     - gRPC server implementation: ``auto``, ``sync``, ``aio`` or ``native``.
+       ``auto`` picks ``native`` when ``pygrpc-native`` is installed and
+       ``aio`` otherwise.
+       ``aio`` receives requests on one event loop and hands only the
+       handlers to worker threads. ``native`` does the HTTP/2 and gRPC
+       framing in Rust, outside the GIL; it needs the ``pygrpc-native``
+       package (``pip install "lmcache[grpc-native]"``), which the
+       ``lmcache/vllm-openai`` and ``lmcache/standalone`` images include.
+       All three serve the same clients over TCP.
+       In ``native`` mode the native front reports the call count and
+       duration metrics itself (pygrpc-native 0.3.0 or later), under the
+       same names, but not the message size ones. Used with
+       ``--transport grpc`` and by the P2P listener.
+   * - ``--hash-algorithm``
+     - ``blake3``
+     - Hash algorithm for token-based operations.
+       Choices: ``builtin``, ``sha256_cbor``, ``blake3``.
+   * - ``--engine-type``
+     - ``default``
+     - Cache engine backend type. ``default`` uses standard prefix
+       caching; ``blend`` composes the CacheBlend ``BlendModule`` into the
+       engine for non-prefix KV reuse and requires
+       ``--supported-transfer-mode`` to be ``lmcache_driven`` or ``auto``.
+       Choices: ``default``, ``blend``.
+   * - ``--supported-transfer-mode``
+     - ``lmcache_driven``
+     - Which worker → server transfer paths the server loads.
+       ``lmcache_driven`` (default) enables only the server-driven
+       transfer path (STORE/RETRIEVE, supports both CUDA IPC and CPU
+       SHM); ``engine_driven`` enables only the non-GPU
+       (PREPARE/COMMIT) transfer path; ``auto`` loads both
+       so workers of either device type can connect without manual
+       configuration.
+       Choices: ``lmcache_driven``, ``engine_driven``, ``auto``.
+   * - ``--isolated-ipc`` / ``--no-isolated-ipc``
+     - ``false``
+     - Assume engine workers and this server run in containers that share
+       no host IPC namespace (``hostIPC``) and no common ``/dev/shm``, and
+       use IPC mechanisms that work there: on CUDA, raw CUDA IPC memory
+       handles for KV-cache registration (instead of PyTorch storage IPC,
+       which needs a shared ``/dev/shm``) and timeline-semaphore events
+       (instead of CUDA interprocess *event* handles). Must match the
+       workers'
+       ``lmcache.mp.isolated_ipc`` setting -- the two mechanisms exchange
+       incompatible event handles, and a mismatch fails at event import
+       on whichever side receives the foreign handle. Currently supported
+       by the vLLM MP connector only; the default stays ``false`` until
+       the integrations that still create raw CUDA interprocess events
+       (SGLang, TensorRT-LLM, CacheBlend, qstore) migrate.
+   * - ``--runtime-plugin-locations``
+     - ``[]``
+     - Zero or more paths to runtime plugin scripts or directories to
+       launch alongside the server. Plugins are spawned by
+       ``MPRuntimePluginLauncher`` and receive the full server config
+       via the ``LMCACHE_RUNTIME_PLUGIN_CONFIG`` environment variable.
+   * - ``--runtime-plugin-config``
+     - ``"{}"``
+     - JSON string of extra key-value config forwarded to runtime
+       plugins via ``LMCACHE_RUNTIME_PLUGIN_EXTRA_CONFIG``. Example:
+       ``'{"plugin.frontend.heartbeat_url": "http://localhost:5000/heartbeat"}'``.
+   * - ``--script-allowed-imports``
+     - ``[]``
+     - Space-separated list of Python module names that scripts posted
+       to the HTTP ``/run_script`` endpoint are allowed to import.
+       Example: ``--script-allowed-imports numpy pandas``.
+   * - ``--run-script-api-enabled``
+     - ``false``
+     - Enable the ``POST /run_script`` HTTP endpoint, which executes
+       caller-supplied Python in-process. The restricted builtins are
+       **not** a security boundary — treat this as full remote code
+       execution and only enable it on a trusted network.
+   * - ``--shm-name``
+     - ``""``
+     - SHM segment name for engine-driven KV transfer (only used when the
+       engine-driven path is loaded, i.e. ``--supported-transfer-mode`` is
+       ``auto`` or ``engine_driven``).
+       ``""`` (empty string, default): SHM disabled; KV transfer uses
+       the typed inline path, which serialises every KV chunk through the
+       request channel and is much slower.  Any other value: create a SHM
+       pool named ``lmcache_l1_pool_<name>`` and use it for KV transfers.
+       **Requires** ``--no-l1-use-lazy``; with the default lazy allocation
+       the name is ignored (the server logs a warning) and SHM stays
+       disabled.  Mutually exclusive with ``--l1-devdax-path`` and
+       ``--l1-use-hugepages``: either combination is rejected with a
+       ``ValueError`` at config validation.  See :ref:`mp-transfer-mode`.
+   * - ``--kv-event-log-size``
+     - ``32768``
+     - CPU store-completion and eviction records retained for subscriptions
+       and reconnects. The scheduler receives pushes over ZMQ or gRPC and republishes
+       them as KV events. ``0`` disables the channel. The channel requires
+       the observability event bus, which ``--disable-observability`` turns
+       off. When vLLM KV events are enabled, its scheduler subscribes to every
+       configured server at startup and maintains a separate heartbeat identity.
+       ``take_events()`` drains these events directly, including under
+       ``MultiConnector``. Disabled channels and terminal stream failures
+       withdraw announced CPU placements and stop reporting them; successful
+       worker stores do not synthesize events. Caching continues unchanged.
+       Publication while idle requires vLLM to call ``take_events()`` while idle.
+       A chunk is announced whether its L1 copy was stored by this engine or
+       loaded by one of its lookups from L2 or a P2P peer. A temporary
+       prefetch copy (``--l2-prefetch-policy skip_l1``, which
+       ``--enable-p2p-write`` selects) is removed again when its reader
+       finishes.
+       Events still carry LMCache chunk hashes and chunk size; native engine
+       block identities are separate work.
+       Must be ``0`` for clients that send chunk hashes instead of tokens;
+       see :ref:`mp-client-chunk-hashes`.
+       With the channel enabled, Stored requires a committed L1 copy of every
+       distinct shard of each registered object group, as determined by its
+       TP replication and DCP sharding, within the same salt and identity tags.
+       Evicting one of several copies of an object does not remove its CPU
+       placement; losing the final copy of a required object does.
+       Duplicate commits are suppressed while the
+       Stored record remains in the replay log. A later commit refreshes an
+       aged-out record. EventBus loss clears the ownership projection and
+       requires fresh commits for every required object.
+   * - ``--worker-reap-timeout-seconds``
+     - ``120.0``
+     - Silence budget (seconds) after which a worker that has sent at
+       least one heartbeat PING but then gone quiet has its KV cache
+       registration reaped, freeing the leaked GPU context and CUDA IPC
+       handles. ``0`` disables reaping. Keep this at least 3x the engine
+       adapter's ``lmcache.mp.heartbeat_interval`` (default 10s) so a few
+       missed pings never reap a live worker; the adapter warns at startup
+       if its interval is raised without raising this.
+   * - ``--worker-registration-grace-seconds``
+     - ``3600.0``
+     - Silence budget (seconds) for a worker that registered but has never
+       sent a PING (still warming up, or died before its first request).
+       Must be >= ``--worker-reap-timeout-seconds``. Generous by default so
+       slow model warmup is never mistaken for a dead worker.
+   * - ``--kv-load-policy``
+     - ``DEFAULT``
+     - Per-request choice between serving a lookup and letting the engine
+       recompute the prompt. The policy runs before the prefetch, so a
+       declined lookup fetches nothing from L2 and takes no locks; the engine
+       sees a miss. ``DEFAULT`` serves every lookup unless the request sets
+       ``"lmcache.skip_load": true`` in ``kv_transfer_params``. A
+       ``package.module:ClassName`` value loads a custom
+       ``lmcache.v1.multiprocess.kv_load_policy.KVLoadPolicy`` subclass from
+       the server's environment, constructed with ``--runtime-plugin-config``.
+   * - ``--enable-segmented-prefix``
+     - ``False``
+     - CacheBlend (``--engine-type blend``) only: on a mid-prefix L2 retrieve
+       failure, retain the gapped prefix so the post-gap chunks stay
+       L1-resident and only the dropped gap is recomputed, instead of
+       truncating the prefix at the gap. No effect for other engines. See
+       :doc:`/mp/l2_storage/fault_inject` for a way to exercise it.
+   * - ``--enable-dedup-content-fingerprint``
+     - ``False``
+     - Blend only: don't re-register fingerprints for content already
+       indexed. KV is still stored. ``--enable-dedup-content`` is a
+       deprecated alias.
+   * - ``--enable-dedup-content-kv``
+     - ``False``
+     - Blend only: don't store chunks fully covered by this request's
+       fingerprint hits (content already cached under another prefix).
+   * - ``--separate-object-groups`` / ``--no-separate-object-groups``
+     - ``True``
+     - Split a hybrid model's kernel groups into one object group per
+       cross-chunk attention window (full attention, each sliding-window
+       size, mamba/GDN) at KV-cache registration. Enabled by default; pass
+       ``--no-separate-object-groups`` to disable it. Keep it enabled for Mamba
+       / linear-attention hybrids so their recurrent state is cached
+       independently. For a non-hybrid model it makes no difference — every
+       layer resolves to one object group. See :doc:`/mp/hybrid_models`.
+
+Lookup Hash Logging
+-------------------
+
+Source: ``lmcache/v1/mp_observability/subscribers/logging/lookup_hash.py``
+
+When enabled, the server publishes chunk hashes computed during ``lookup()``
+as ``MP_LOOKUP`` events on the EventBus.  The
+``LookupHashLoggingSubscriber`` writes these to rotating JSONL files for
+offline analysis.  Disabled by default.  These arguments are part of the
+Observability group.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 55
+
+   * - Argument
+     - Default
+     - Description
+   * - ``--lookup-hash-log-dir``
+     - ``""`` (disabled)
+     - Directory to write lookup hash JSONL files.
+       An empty string disables logging.
+   * - ``--lookup-hash-log-rotation-interval``
+     - ``21600`` (6 h)
+     - Time interval in seconds before rotating to a new log file.
+   * - ``--lookup-hash-log-rotation-max-size``
+     - ``104857600`` (100 MB)
+     - Max file size in bytes before rotating even if the time
+       interval has not elapsed.
+   * - ``--lookup-hash-log-max-files``
+     - ``100``
+     - Max number of log files to keep.  Oldest files are deleted
+       when this limit is exceeded.
+
+.. _mp-client-chunk-hashes:
+
+Client-Computed Chunk Hashes
+----------------------------
+
+Source: ``lmcache/v1/client/chunk_hashes.py``
+
+By default every lookup, lock release, store and retrieve key carries the
+request's whole token prefix, and the server decodes it and hashes it chunk
+by chunk. A client may instead send the hashes itself
+(``IPCCacheServerKey.chunk_hashes``): the rolling hash of every complete
+chunk in ``[0, end)``, computed with the server's own ``TokenHasher`` so the
+keys are byte-identical. The server then neither decodes nor hashes tokens.
+The ATOM adapters send them when built with ``client_chunk_hashes=True``;
+other clients keep sending tokens. This key form has these requirements:
+
+- **blake3 only.** Client hashes are blake3. A server started with another
+  ``--hash-algorithm`` rejects such keys.
+- **No unfull chunk.** The hashes cover complete chunks only, so such a key
+  never stores or loads the unfull chunk at an unaligned ``end``; its ``end``
+  is floored to a chunk boundary as before unfull chunks existed. The key must
+  carry exactly ``end // chunk_size`` hashes at the registration's chunk size;
+  the server rejects any other count.
+- **Upgrade the server first.** An older server does not know the field and
+  sees an empty token prefix: lookups report no hit and stores and retrieves
+  fail. Turn the client option on only after every server it talks to runs a
+  version that supports it.
+- **KV events and coordinator reporting must be off.** Both bind every stored
+  chunk to its token ids, which these keys do not have, and the KV-event
+  channel is on by default (``--kv-event-log-size 32768``). While either is
+  enabled, the server rejects these keys with an error naming the flags. Start
+  the server with ``--kv-event-log-size 0`` (or ``--disable-observability``),
+  without ``--coordinator-event-reporting``, and without
+  ``--trace-level events``.
+
+Example:
+
+.. code-block:: bash
+
+   lmcache server        --hash-algorithm blake3        --kv-event-log-size 0
+
+HTTP Frontend
+-------------
+
+Source: ``lmcache/v1/multiprocess/config.py``
+
+The HTTP frontend is included when running ``lmcache server``.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 55
+
+   * - Argument
+     - Default
+     - Description
+   * - ``--http-host``
+     - ``127.0.0.1``
+     - Host to bind the HTTP (FastAPI/uvicorn) server.
+   * - ``--http-port``
+     - ``8080``
+     - Port to bind the HTTP server.
+   * - ``--api-key-file``
+     - unset
+     - Read a bearer API key from a file. Repeat the option to accept multiple
+       keys during rotation. ``LMCACHE_API_KEY_FILE`` and
+       ``LMCACHE_API_KEY`` provide environment alternatives. All sources
+       are cumulative. When none are set, authentication is disabled. ``/``
+       and ``/healthcheck`` remain public when authentication is enabled.
+
+P2P
+---
+
+Source: ``lmcache/v1/multiprocess/config.py``
+
+These flags configure peer-to-peer KV cache sharing between MP servers
+(see :doc:`p2p`). They are registered by ``add_p2p_args()`` on the
+``lmcache server`` parser. P2P is enabled when ``--p2p-advertise-url``
+is set, which additionally requires a coordinator URL via
+``--coordinator-url`` (or ``LMCACHE_COORDINATOR_URL``).
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 55
+
+   * - Argument
+     - Default
+     - Description
+   * - ``--p2p-advertise-url``
+     - ``""`` (P2P disabled)
+     - Transfer-channel server ``host:port`` this instance advertises to
+       peers. Setting it enables P2P (also requires ``--coordinator-url``).
+   * - ``--p2p-listen-url``
+     - ``""``
+     - Transfer-channel server ``host:port`` to bind. Defaults to
+       ``--p2p-advertise-url``.
+   * - ``--p2p-rpc-port``
+     - ``0``
+     - Independent P2P gRPC control port, bound on ``--host``. ``0`` lets the
+       OS choose a free port. Pin and allow this port when a firewall,
+       Docker port mapping, or NetworkPolicy restricts reachable ports;
+       allowing only the worker ``--port`` is insufficient.
+   * - ``--p2p-lookup-timeout``
+     - ``30.0``
+     - Seconds before a peer lookup result counts as a miss.
+   * - ``--p2p-load-timeout``
+     - ``30.0``
+     - Seconds before a peer load counts as a failure.
+   * - ``--p2p-transfer-engine``
+     - ``nixl``
+     - Transfer-channel implementation to use.
+   * - ``--enable-p2p-write``
+     - off
+     - Store objects into peers' L1 once the local DRAM L1 is fuller than
+       ``--p2p-write-l1-usage-threshold``, and drop the local copy. Use it on
+       a server whose peers extend its DRAM, on only one side of a pair.
+       Selects the ``p2p`` store policy and the ``skip_l1`` prefetch policy
+       unless ``--l2-store-policy`` or ``--l2-prefetch-policy`` is set.
+       See :doc:`p2p_deployment`.
+   * - ``--p2p-write-l1-usage-threshold``
+     - ``0.7``
+     - Used fraction of the local DRAM L1, in ``(0, 1]``, at which new objects
+       are stored into a peer instead of staying local. Keep it below
+       ``--eviction-trigger-watermark``.
+   * - ``--p2p-store-timeout``
+     - ``30.0``
+     - Seconds before a store into a peer counts as a failure.
+
+L1 Memory Manager
+------------------
+
+Source: ``lmcache/v1/distributed/config.py``
+
+Use repeatable ``--l1-manager '<JSON>'`` for tagged DRAM, Device-DAX, and
+GDS managers. See :doc:`multi_l1` for the schema, placement order,
+automatic L2 affinity, and per-manager reporting. The flags below remain the legacy
+single-L1 interface. For placing L1 on CXL-attached memory see
+*Device-DAX / CXL L1* below.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 55
+
+   * - Argument
+     - Default
+     - Description
+   * - ``--l1-size-gb``
+     - *required without* ``--l1-manager``
+     - Size of the L1 tier in GB. Sizes the pinned-DRAM L1 by default, or the
+       GDS slab file when ``--gds-l1-path`` is set (see *GDS L1 Tier* below).
+   * - ``--l1-use-lazy`` / ``--no-l1-use-lazy``
+     - ``True``
+     - Enable or disable lazy allocation for L1 memory.
+       Pass ``--l1-use-lazy`` to enable (default) or
+       ``--no-l1-use-lazy`` to explicitly disable.  Lazy allocation
+       disables the SHM transfer pool: pass ``--no-l1-use-lazy`` whenever
+       you set ``--shm-name`` for engine-driven workers.
+   * - ``--l1-init-size-gb``
+     - ``20``
+     - Initial allocation size (GB) when using lazy allocation.
+   * - ``--l1-align-bytes``
+     - ``4096``
+     - Alignment size in bytes (default 4 KB).
+   * - ``--l1-use-hugepages`` / ``--no-l1-use-hugepages``
+     - ``False``
+     - Allocate the L1 pool from the 2 MiB hugepage pool instead of regular
+       pinned memory. It requires pre-allocated hugepages
+       (``sysctl vm.nr_hugepages``). Mutually exclusive with ``--shm-name``
+       and ``--l1-use-lazy`` (enabling it auto-disables lazy).
+   * - ``--l1-devdax-path``
+     - *(not set)*
+     - Optional ``/dev/dax*`` device or mmap-able file to use as the L1
+       backing arena.  When set, disable lazy allocation with
+       ``--no-l1-use-lazy`` and leave ``--shm-name`` at its default ``""``
+       because the L1 bytes live in the DAX mapping; a non-empty
+       ``--shm-name`` (or ``--l1-use-lazy``) together with this flag is
+       rejected with a ``ValueError``.  A ``dax`` L2 adapter may not map the
+       same device range;
+       give the L1 and the adapter disjoint ranges. Pass the device node,
+       for example
+       ``--l1-devdax-path /dev/dax0.0 --l1-size-gb 512 --no-l1-use-lazy
+       --shm-name ""``; find the node for a CXL region with ``daxctl list``.
+       See *Device-DAX / CXL L1* below.
+   * - ``--l1-devdax-offset-gb``
+     - ``0``
+     - Offset into ``--l1-devdax-path``, in GiB, where the L1 mapping starts.
+       Lets several LMCache servers share one CXL device by mapping disjoint
+       ranges, for example offset 0 and 512 with ``--l1-size-gb 512`` each.
+       The range must fit within the device, and offset and size must be
+       multiples of the device alignment.
+       ``--l1-manager`` key: ``offset_gb``.
+   * - ``--l1-mlock``
+     - ``False``
+     - ROCm only. ``mlock`` the DRAM L1 so memory compaction cannot migrate
+       it. See *Locked L1 on ROCm* below. ``--l1-manager`` key: ``mlock``.
+
+.. _mp-devdax-l1:
+
+Device-DAX / CXL L1
+~~~~~~~~~~~~~~~~~~~
+
+L1 can live on CXL or persistent memory exposed as a Device-DAX node
+``/dev/daxX.Y``. The server maps the device with ``mmap(MAP_SHARED)`` and
+allocates KV objects inside the mapping. The index is in server memory, so
+the tier restarts empty.
+
+**Device path and offset.** The mapping covers ``[offset, offset + size)``
+of the device; the offset defaults to 0 (``--l1-devdax-offset-gb`` in the
+legacy form, ``offset_gb`` in the tagged form). To share one CXL device, give
+each server, and the ``dax`` L2 adapter in the same server, a disjoint range.
+Overlapping ranges within a server are rejected; LMCache does not coordinate
+offsets between servers. The device must be in ``devdax`` mode (CXL memory
+is often onlined as ``system-ram``), the range must fit within the device,
+and offset and size must be multiples of the device alignment:
+
+.. code-block:: bash
+
+   cxl list -r                                   # CXL regions and ids
+   daxctl list                                   # dax devices: region, size, mode, align
+   daxctl reconfigure-device --mode=devdax dax0.0
+   ls -l /dev/dax0.0                             # path to pass to LMCache
+
+**Tagged form (recommended).** ``size_gb`` is mapped from ``path`` starting
+at ``offset_gb`` (default 0); there is no implicit DRAM pool. With no DRAM
+manager, L2 adapters use the Device-DAX L1. This is the second of two servers
+sharing a 1 TiB device:
+
+.. code-block:: bash
+
+   lmcache server --chunk-size 256 --eviction-policy LRU --port 6555 \
+       --l1-manager '{"type":"DEVDAX","tag":"cxl","size_gb":512,"offset_gb":512,"path":"/dev/dax0.0"}' \
+       --l2-adapter '{"type":"fs","base_path":"/mnt/archive/lmcache"}'
+
+List a ``DRAM`` manager first to spill into CXL only on ``OUT_OF_MEMORY``.
+Schema in :doc:`multi_l1`.
+
+**Legacy form.** ``--l1-size-gb`` is the mapped size and
+``--l1-devdax-offset-gb`` where it starts; lazy allocation and SHM must be
+off:
+
+.. code-block:: bash
+
+   lmcache server --chunk-size 256 --eviction-policy LRU --port 6555 \
+       --l1-devdax-path /dev/dax0.0 --l1-size-gb 512 --l1-devdax-offset-gb 512 \
+       --no-l1-use-lazy --shm-name ""
+
+A Device-DAX L1 is a pool of its own. To combine it with DRAM, configure a
+``DRAM`` and a ``DEVDAX`` manager with ``--l1-manager`` (see
+:doc:`multi_l1`); the write policy decides which keys land in which pool.
+A ``dax`` L2 adapter on the same device range as the L1 is rejected at
+startup.
+
+**Verify.** ``GET /status`` reports ``l1_capacity_bytes_by_backend`` with a
+``devdax`` entry equal to the mapped size; Prometheus
+``lmcache_mp_l1_memory_usage_bytes`` carries ``backend="devdax"``. Host
+pinning of the mapping is best-effort; check the startup log for a
+fallback to pageable copies.
+
+**Runtime changes and limits.** With the legacy interface, whole ranges
+can be added and drained while serving via
+``/reconfigure/dax/l1/{status,add,remove}`` (:doc:`http_api`), each with
+its own ``offset``; the initial range is the primary arena and cannot be
+removed, and tagged multi-L1 topologies are fixed at startup. P2P, NIXL, and Mooncake-over-RDMA L2
+adapters are unsupported because they need one contiguous L1 region; the
+SHM transfer channel is disabled; GDS L1 and ``--l1-mlock`` cannot be
+combined with it. For a persistent Device-DAX tier use the L2 adapter in
+:doc:`l2_storage/dax`.
+
+Locked L1 on ROCm
+-----------------
+
+On ROCm, ``hipHostRegister`` does not page-lock memory: when the kernel
+migrates a registered L1 page (memory compaction), the driver evicts all GPU
+queues of the server until the mapping is restored, which stalls transfers for
+seconds. ``--l1-mlock`` keeps the L1 as ordinary anonymous memory (O_DIRECT,
+RDMA registration and memory-cgroup accounting are unchanged) and locks it.
+Requirements, checked at startup:
+
+- the node sets ``sysctl -w vm.compact_unevictable_allowed=0``; otherwise
+  compaction still moves locked pages;
+- the server may lock the whole L1: ``docker run --ulimit memlock=-1`` or
+  ``CAP_IPC_LOCK``.
+
+Not covered: explicit page migration (``move_pages``, ``migrate_pages``,
+NUMA balancing), khugepaged when transparent huge pages are ``always``
+(use ``madvise`` or ``never``), and host memory registered by other
+processes such as vLLM. Device-DAX L1 is rejected.
+
+GDS L1 Tier
+-----------
+
+Source: ``lmcache/v1/distributed/config.py``
+
+Opt-in. Setting ``--gds-l1-path`` switches the L1 medium from pinned DRAM to
+an NVMe slab file accessed via GPUDirect Storage DMA. The CPU pinned-DRAM tier
+is then disabled, and ``--l1-size-gb`` sizes the slab. Disable byte-array L2
+adapters when this is on (the GDS tier exposes no L1 memory buffer for them to
+register).
+
+The DMA path is selected automatically by platform: **cuFile**
+(``libcufile.so``) on NVIDIA and **hipFile** (``libhipfile.so``,
+`ROCm/hipFile <https://github.com/ROCm/hipFile>`_) on AMD ROCm. The same
+flags apply to both; no configuration change is needed to switch vendors.
+
+**muFile** (``libmufile.so``) is selected automatically on MUSA, or
+explicitly with ``--gds-l1-backend mufile``. It uses the SmartIO muFile
+stream-ordered API and a filesystem slab, so the SmartIO runtime and its
+MUSA-compatible ``libmufile.so`` must be installed on every worker.
+
+**uGDS** (``libugds.so``) is a third, opt-in backend selected with
+``--gds-l1-backend ugds``. It is a user-space GPUDirect Storage library that
+builds NVMe commands and rings doorbells from user space, so its IO path issues
+no syscall. LMCache can use uGDS on either NVIDIA CUDA or AMD ROCm. Each
+deployment must use a ``libugds.so`` built for its active platform. Unlike
+cuFile and hipFile, uGDS does not use a filesystem: the slab is mapped directly
+onto a raw character device, and ``--gds-l1-path`` must name that device (for
+example ``/dev/ugds_drv0``) rather than a directory. The first
+``--l1-size-gb`` bytes of the device are the slab, so the device must be at
+least that large and must not hold anything else.
+
+**Phoenix** (``libphoenix.so``) is a fourth opt-in backend selected with
+``--gds-l1-backend phx``. Phoenix (phxfs) provides a kernel-mediated
+user-space NVMe-to-GPU DMA path with a very low software-stack overhead.
+Like cuFile and hipFile it uses a filesystem slab: ``--gds-l1-path`` names
+an NVMe directory, ``--gds-l1-use-direct-io`` applies, and the slab file
+can share the disk with other data. Each GPU staging buffer is registered with
+phxfs (``phxfs_regmem``, 64 KiB-aligned) and the slab is read and written
+with stream-ordered submissions (``phxfs_read_stream`` /
+``phxfs_write_stream``) that keep the DMA ordered with the other work on
+the stream. A ``libphoenix`` build without the stream-ordered API fails
+to load. Follow the
+`Phoenix installation guide <https://github.com/xPU-IO/Phoenix/blob/main/doc/install.md>`_
+to build ``libphoenix.so``, load the ``phoenixfs`` kernel module, and
+verify the installation.
+
+
+
+.. note::
+
+   AMD hipFile requires ROCm >= 7.2.0. The zero-copy GPUDirect fast path
+   additionally needs a kernel built with ``CONFIG_PCI_P2PDMA``,
+   ``amdgpu-dkms >= 30.20.1``, and the slab on a local NVMe ext4/xfs
+   filesystem; where those are unavailable hipFile transparently falls back to
+   a host-bounce compatibility path (correct, but not zero-copy).
+
+.. note::
+
+   uGDS requires its kernel module loaded and the NVMe device bound to it, and
+   a platform-matching ``libugds.so`` reachable through the loader
+   (``LD_LIBRARY_PATH`` or ``ldconfig``). Because the device is claimed by
+   ``ugds_drv`` rather than the kernel NVMe driver, it carries no filesystem
+   and cannot be shared with any other consumer while in use. Follow the
+   `uGDS installation guide <https://github.com/ScaleX-IO/uGDS/blob/main/docs/installation.md>`_
+   to build and load the kernel module, bind the NVMe device, build
+   ``libugds.so``, and verify the installation.
+
+   At startup LMCache queries the namespace capacity through
+   ``uGDSGetDeviceCapacity`` and rejects an aligned ``--l1-size-gb`` value larger
+   than the device. The installed ``libugds.so`` must provide this API; LMCache
+   fails closed with an upgrade message when an older library cannot report
+   capacity.
+.. warning::
+
+   uGDS requires an **entire dedicated SSD whose contents may be destroyed**.
+   Ensure the SSD is not used for any other purpose and that its contents are
+   not critical.
+
+.. note::
+
+   Phoenix requires the ``phoenixfs`` kernel module loaded and a
+   platform-matching ``libphoenix.so`` reachable through the loader
+   (``ldconfig`` or ``LD_LIBRARY_PATH``). It has been validated on NVIDIA
+   GPUs; other platforms require a matching ``libphoenix`` build and are not
+   yet tested.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 55
+
+   * - Argument
+     - Default
+     - Description
+   * - ``--gds-l1-path``
+     - Not set
+     - NVMe directory for the GDS L1 slab, or the raw device path when
+       ``--gds-l1-backend ugds`` is used. Setting this enables the GDS L1
+       tier; with cuFile, hipFile, or phx one shared slab per process lives
+       at ``<path>/lmcache_gds_slab.bin``.
+   * - ``--gds-l1-backend``
+     - ``auto``
+     - GDS implementation: ``auto``, ``cufile``, ``hipfile``, ``mufile``,
+       ``ugds``, or ``phx``. ``auto`` selects cuFile on CUDA, hipFile on
+       ROCm, and muFile on MUSA.
+   * - ``--gds-l1-use-direct-io`` / ``--no-gds-l1-use-direct-io``
+     - ``True``
+     - Open the slab with ``O_DIRECT`` (required for the GDS DMA fast path on
+       ext4). Ignored by ``ugds``, whose IO bypasses the kernel entirely.
+
+L1 Manager TTLs
+----------------
+
+Source: ``lmcache/v1/distributed/config.py``
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 55
+
+   * - Argument
+     - Default
+     - Description
+   * - ``--l1-write-ttl-seconds``
+     - ``600``
+     - Time-to-live for each object's write lock (seconds).
+   * - ``--l1-read-ttl-seconds``
+     - ``300``
+     - Time-to-live for each object's read lock (seconds).
+
+Eviction Policy
+---------------
+
+Source: ``lmcache/v1/distributed/config.py``
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 55
+
+   * - Argument
+     - Default
+     - Description
+   * - ``--eviction-policy``
+     - *required*
+     - Eviction policy.
+       Choices: ``LRU``, ``ARC``, ``IsolatedLRU``, ``noop``.
+       ``ARC`` adaptively balances recently created keys and frequently
+       accessed keys. It keeps key-only ghost history for completed policy
+       evictions; no KV data is retained in the ghost lists.
+       Use ``noop`` for buffer-only mode where L1 acts as a pure
+       write buffer (data is deleted from L1 after L2 store).
+       ``IsolatedLRU`` maintains one LRU list per ``cache_salt``
+       and requires per-``cache_salt`` quotas to be configured at
+       runtime via the ``/quota`` HTTP endpoints
+       (see :ref:`mp-http-quota-api`); a ``cache_salt`` with no
+       registered quota has an effective limit of ``0`` bytes,
+       so its data is evicted at the next eviction cycle
+       (allowlist semantics).
+   * - ``--eviction-trigger-watermark``
+     - ``0.8``
+     - Memory usage ratio (0.0--1.0) that triggers eviction.
+   * - ``--eviction-ratio``
+     - ``0.2``
+     - Fraction of allocated memory to evict when triggered (0.0--1.0).
+       It also sets when stores to L2 wait: new ones wait once in-flight ones
+       reach ``trigger_watermark * (1 - eviction_ratio)`` of L1, so locked data
+       cannot fill L1 and block new KV and prefetches. At ``1.0`` this is 0, so
+       they go out one batch at a time.
+
+L2 Policies
+-----------
+
+Source: ``lmcache/v1/distributed/config.py``
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 55
+
+   * - Argument
+     - Default
+     - Description
+   * - ``--l2-store-policy``
+     - ``default``
+     - L2 store policy.  Determines which adapters receive each key
+       and whether keys are deleted from L1 after L2 store.
+       The ``default`` policy stores all keys to all adapters and keeps L1.
+       The ``skip_l1`` policy stores all keys to all adapters and then
+       deletes them from L1 (buffer-only mode).
+       The ``p2p`` policy keeps keys in L1 until its usage reaches
+       ``--p2p-write-l1-usage-threshold``, then stores new keys into one P2P
+       peer and deletes them from L1; ``--enable-p2p-write`` selects it
+       automatically (see :doc:`p2p_deployment`).
+       Choices: ``default``, ``skip_l1``, ``p2p``.
+   * - ``--l2-prefetch-policy``
+     - ``default``
+     - L2 prefetch policy.  Determines which adapter loads each key
+       when multiple adapters have it.
+       The ``default`` policy picks the first adapter (lowest index) and
+       keeps prefetched keys in L1.
+       The ``skip_l1`` policy uses the same load plan, but prefetched keys
+       are temporary (deleted after the reader finishes);
+       ``--enable-p2p-write`` selects it automatically.
+       Choices: ``default``, ``skip_l1``.  ``retain`` is a deprecated alias
+       of ``default``.
+   * - ``--l2-prefetch-inflight-watermark``
+     - ``0.5``
+     - Fraction of L1 capacity, in (0, 1], that in-flight prefetch
+       (L2 load) requests may stage in L1.
+   * - ``--l2-prefetch-max-in-flight``
+     - (none)
+     - Deprecated and ignored; prefetch admission follows
+       ``--l2-prefetch-inflight-watermark``.  Logs a warning when set.
+   * - ``--periodic-notifier-interval-ms``
+     - ``5``
+     - Interval in milliseconds for the periodic event notifier
+       heartbeat.  A native C++ background thread writes to all
+       registered file descriptors at this interval, waking
+       controller poll loops for L2 adapters that lack native
+       async completion callbacks.
+
+L2 Adapters
+-----------
+
+Source: ``lmcache/v1/distributed/l2_adapters/config.py``
+
+L2 adapters are configured via repeatable ``--l2-adapter <JSON>`` arguments.
+Each JSON object must include a ``"type"`` field that selects the adapter type.
+Each adapter stores from and reloads into an L1 chosen automatically; see
+:doc:`multi_l1`.
+The order of ``--l2-adapter`` arguments determines the adapter order (cascade).
+
+Registered adapter types: ``nixl_store``, ``nixl_store_dynamic``, ``fs``,
+``fs_native``, ``mock``, ``mooncake_store``, ``aerospike``, ``bigtable``,
+``sagemaker-hyperpod``, ``s3``, ``hfbucket``, ``resp``, ``valkey``,
+``plugin``, ``native_plugin``, ``raw_block``, ``dax``, ``fault_inject``.
+(A ``p2p`` type is also registered, but it is wired in dynamically by the
+:doc:`P2P subsystem </mp/p2p>` rather than configured via ``--l2-adapter``.)
+
+Each adapter type's required and optional fields, plus per-backend examples, are
+documented on its own page under :doc:`Secondary KV Storage <l2_storage/index>`
+-- including the adapters not detailed inline here (``fs_native``,
+``raw_block``, ``dax``, ``mooncake_store``, ``aerospike``, ``bigtable``,
+``sagemaker-hyperpod``, ``hfbucket``, ``resp``, ``valkey``).
+
+Multiple adapters (cascade)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Pass ``--l2-adapter`` multiple times.  Adapters are used in the order given:
+
+.. code-block:: bash
+
+    --l2-adapter '{"type": "nixl_store", "backend": "POSIX", "backend_params": {"file_path": "/data/ssd/l2", "use_direct_io": "false"}, "pool_size": 64}' \
+    --l2-adapter '{"type": "nixl_store", "backend": "GDS", "backend_params": {"file_path": "/data/nvme/l2", "use_direct_io": "true"}, "pool_size": 128}'
+
+Observability
+-------------
+
+Source: ``lmcache/v1/mp_observability/config.py``
+
+See :doc:`observability/index` for full details on the three modes (metrics,
+logging, tracing).
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 55
+
+   * - Argument
+     - Default
+     - Description
+   * - ``--disable-observability``
+     - off
+     - Master switch: disable the EventBus entirely.
+   * - ``--disable-metrics``
+     - off
+     - Skip metrics subscribers (no Prometheus endpoint).
+   * - ``--disable-grpc-metrics``
+     - off
+     - Skip gRPC Python runtime metrics while keeping LMCache metrics enabled.
+       By default, the MP server enables these metrics only for
+       ``--transport grpc``.
+   * - ``--disable-logging``
+     - off
+     - Skip logging subscribers.
+   * - ``--enable-tracing``
+     - off
+     - Register tracing subscribers. Requires ``--otlp-endpoint``.
+   * - ``--event-bus-queue-size``
+     - ``10000``
+     - Max events in the EventBus queue before tail-drop.
+   * - ``--otlp-endpoint``
+     - *(none)*
+     - OTLP gRPC endpoint for exporting metrics and traces.
+   * - ``--prometheus-port``
+     - ``9090``
+     - Port for the Prometheus ``/metrics`` endpoint.
+   * - ``--metrics-sample-rate``
+     - ``0.01``
+     - Fraction of chunks/blocks in ``(0, 1.0]`` to track for lifecycle
+       histograms. Counters always count every event regardless of this
+       setting.
+   * - ``--trace-level``
+     - *(none)*
+     - Enable trace recording at the given level. ``storage`` records
+       ``StorageManager`` public-API calls for offline replay via
+       ``lmcache trace``. ``events`` records the cache-event stream this
+       server emits for the MP coordinator, with or without one
+       configured. See :doc:`tracing_and_debugging`.
+   * - ``--trace-output``
+     - *(none)*
+     - Path to write the trace file. If omitted while ``--trace-level``
+       is set, a timestamped file under ``$TMPDIR``
+       (``lmcache-trace-<pid>-<UTC>.lct``) is minted and its path is
+       logged at INFO.
+   * - ``--enable-extra-logging``
+     - off
+     - Periodic INFO logs: per-GPU L0<->L1 transfer stats and L1 memory
+       usage. See :doc:`observability/logs`.
+   * - ``--extra-logging-interval``
+     - ``10.0``
+     - Seconds between extra-logging emissions.
+
+vLLM Client Configuration
+--------------------------
+
+On the vLLM side, specify the LMCache server host and port via the
+``kv_connector_extra_config`` parameter. The URL scheme selects the request
+transport: use ``grpc://`` for gRPC (the default) or ``tcp://`` for ZMQ,
+matching the server's ``--transport`` setting. A bare host is accepted and
+normalized to ``grpc://``; ``tcp://`` keeps working until ZMQ is removed:
+
+.. code-block:: bash
+
+    vllm serve Qwen/Qwen3-14B \
+        --kv-transfer-config \
+        '{"kv_connector":"LMCacheMPConnector", "kv_role":"kv_both", "kv_connector_extra_config": {"lmcache.mp.host": "127.0.0.1", "lmcache.mp.port": 6000}}'
+
+To target multiple LMCache servers from a single vLLM deployment, pass a
+list (or comma-separated string) of server URLs via
+``lmcache.mp.server_urls``. When set, ``server_urls`` takes precedence
+over the single-server ``host`` / ``port`` keys; vLLM's world size must
+be divisible by the number of servers, and each worker connects only to
+its locally-assigned server (global ranks are sliced into contiguous
+blocks, one block per server). Multi-server mode currently supports
+tensor parallelism only -- pipeline parallelism (``pp_size > 1``) and
+data parallelism (``dp_size > 1``) are rejected with a clear error.
+
+.. code-block:: bash
+
+    vllm serve Qwen/Qwen3-14B \
+        --tensor-parallel-size 4 \
+        --kv-transfer-config \
+        '{"kv_connector":"LMCacheMPConnector", "kv_role":"kv_both", "kv_connector_extra_config": {"lmcache.mp.server_urls": "grpc://host1:6667,grpc://host2:6667"}}'
+
+LoRA adapters
+~~~~~~~~~~~~~
+
+With ``--enable-lora``, the same prompt produces different KV under each
+adapter, so the connector adds the adapter to every lookup, store, retrieve
+and lock release as the ``lora`` tag (the ``lmcache.tag.lora`` request
+config). The server makes ``lmcache.tag.*`` part of each object key, so KV
+written under one adapter is never loaded for another adapter or for the base
+model. The tag is
+``hashlib.blake2b(f"{lora_name}\0{lora_path}".encode(), digest_size=16).hexdigest()``
+(``lora_cache_tag`` in ``lmcache/integration/vllm/utils.py``), so replicas and
+P/D peers share an adapter's KV only when they load it under the same name
+and path. The connector ignores a ``lmcache.tag.lora`` value sent by the
+client.
+
+Base-model keys do not change, and adapter requests keep their
+``cache_salt``, so per-salt metrics and quotas still count them with their
+tenant. KV that adapter requests wrote before this change sits under
+base-model keys, where base-model requests keep hitting it until it is
+evicted, so clear persistent L2 backends when upgrading. Upgrade every
+replica and MP server together, since an older MP server ignores the tag and
+adapters would share KV again.
+
+Decode context parallelism (DCP)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``--decode-context-parallel-size`` is supported. Under DCP, vLLM shards the
+attention KV cache across ranks along the token axis, so each rank holds only
+a strided ``1/dcp`` slice and one block ID spans ``block_size * dcp`` tokens.
+LMCache stores each rank's opaque page as its own object and a chunk counts as
+a hit only when every rank's slice is present. Non-trivial
+``--cp-kv-cache-interleave-size`` values are supported when they evenly divide
+every resolved attention cache block size. Because interleave changes the
+token-to-slot byte layout, the connector automatically adds the DCP size and
+interleave value to its internal cache namespace. This prevents pages written
+by one interleave layout from being loaded by another. It does not change the
+model name served by vLLM, but the decorated cache model name is visible in MP
+metric labels so operators can distinguish incompatible cache layouts.
+
+The vLLM MP connector automatically resolves a compatible effective chunk size.
+For a
+single attention group, the required alignment is
+``block_size * decode_context_parallel_size``. For a hybrid model, it is the
+least common multiple of every attention group's DCP-scaled block span and
+every recurrent-state group's unscaled physical block span. The connector
+treats the server's ``--chunk-size`` as a minimum and rounds it up locally to
+the smallest compatible multiple; see :doc:`chunk_size_negotiation`.
+
+The example model also needs a vLLM build that can run it under DCP:
+Kimi-Linear DCP support landed after v0.27.1 (vLLM commit ``63ac04a61e``,
+PR #50484). On stock v0.27.1 the command below fails at startup with
+``Kimi-K3 MultiHeadLatentAttention does not support context parallelism``.
+
+.. code-block:: bash
+
+    # block_size 1024 x dcp 2 -> a server minimum of 256 resolves to 2048
+    lmcache server --host localhost --port 6000 --chunk-size 256 \
+        --l1-size-gb 20 --eviction-policy LRU
+
+    vllm serve moonshotai/Kimi-Linear-48B-A3B-Instruct \
+        --trust-remote-code \
+        --tensor-parallel-size 2 \
+        --decode-context-parallel-size 2 \
+        --kv-transfer-config \
+        '{"kv_connector":"LMCacheMPConnector", "kv_role":"kv_both", "kv_connector_extra_config": {"lmcache.mp.host": "127.0.0.1", "lmcache.mp.port": 6000}}'
+
+Pipeline parallelism and multiple LMCache servers may both be combined with
+DCP. These combinations are rejected at startup:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Rejected with DCP
+     - Reason
+   * - ``--prefill-context-parallel-size > 1``
+     - Adds a second KV shard axis this connector does not map.
+   * - Fewer than ``dcp_size`` ranks per LMCache server
+     - No server holds a complete set of shards, and lookup takes the
+       minimum hit count across servers, so it reports no hits.
+
+An interleave value that is non-positive, larger than a resolved attention
+cache block, or does not evenly divide every resolved attention block is
+rejected at connector startup.
+
+``decode_context_parallel_size > tensor_parallel_size`` is rejected by vLLM
+itself, so this connector does not re-check it.
+
+``LMCacheMPConnector`` reads the following keys from
+``kv_connector_extra_config``:
+
+Model revision
+~~~~~~~~~~~~~~
+
+``--revision`` is part of the cache identity. When vLLM resolves it to a commit
+hash, the connector adds ``lmcache.tag.revision=<commit>`` to every request's
+configuration. The server extracts it with the same ``lmcache.tag.*`` contract
+as any other identity tag, so objects written by two revisions of one model ID
+never mix while the served model name stays unchanged. Tags are already part of
+the L2 key format, so the separation holds for disk and remote tiers as well.
+
+A revision vLLM cannot resolve (local model path, ModelScope, offline Hub
+lookup) is sent literally; pinning a commit hash keeps the identity stable
+across restarts. Engines that do not pass ``--revision`` add no tag and keep
+their existing cache namespace.
+
+The KV layout registry is keyed by model name and world size, so engines at two
+revisions of one model ID share the registered layout. That is correct as long
+as the revisions keep the same cache layout, which is the case for weights-only
+revisions.
+
+Connector ``extra_config`` Keys
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+All connector-level options are passed through
+``kv_connector_extra_config`` and use the ``lmcache.mp.`` prefix.
+
+By default, MP caches only prompt tokens, avoiding new cache entries from
+sampled output when fixed prompts are replayed.
+
+Set ``"lmcache.mp.save_decode_cache": true`` in ``kv_connector_extra_config``
+for resumable or streaming sessions, where generated tokens become part of a
+growing prompt across turns within the same request. This setting is separate
+from the in-process connector's ``save_decode_cache`` YAML/environment setting.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 55
+
+   * - Key
+     - Default
+     - Description
+   * - ``lmcache.mp.save_decode_cache``
+     - ``false``
+     - Cache generated tokens in addition to prompt tokens.
+   * - ``lmcache.mp.save_unfull_chunk``
+     - ``false``
+     - Also cache the trailing partial chunk of each prompt, covering the
+       prompt up to where vLLM's prefix cache could resume (a token count on
+       its hit grid, below the prompt's last token), and, for a request that
+       ends at its prompt (a disaggregated prefill), up to the full prompt
+       length, so a later lookup (a disaggregated decode, or a chat's next
+       round) can hit past the last chunk boundary. A request whose ``kv_transfer_params`` set
+       ``"lmcache.temporary_unfull_chunk": true`` stores its partial chunk
+       read-once. That grid point falls inside the last chunk only when vLLM's
+       hit grid is finer than the chunk. For a Mamba hybrid vLLM's grid
+       defaults to its unified block size, which the chunk is a multiple of;
+       with a one-block chunk (Qwen3.8-27B: 832 tokens) only exact tails are
+       then stored. Set a finer grid with ``vllm serve --prefix-match-unit``
+       (e.g. ``32``; it must divide every KV cache group's block size).
+       Served from L1 only. Requires the ``lmcache_driven``
+       transfer mode; not supported with speculative decoding,
+       ``lmcache.mp.lazy_offload``, or compressed-attention models with a
+       per-request ring (DeepSeek-V4.1, GLM-5.3, Qwen3.8-Flash-Next) yet.
+   * - ``lmcache.mp.server_urls``
+     - *(unset)*
+     - Multi-server deployment: list (or comma-separated string) of
+       ``<transport>://<host>:<port>`` URLs, e.g.
+       ``"grpc://host1:6667,grpc://host2:6667"``. The transport prefix
+       may be omitted -- bare ``host:port`` entries such as
+       ``"host1:6667,host2:6667"`` are normalized to ``grpc://`` by the
+       connector. When set, takes precedence over ``lmcache.mp.host`` /
+       ``lmcache.mp.port``; the vLLM world size must be divisible by the
+       number of servers, and each worker connects to its
+       locally-assigned server.
+   * - ``lmcache.mp.host``
+     - ``grpc://localhost``
+     - Single-server deployment: request transport and host of the LMCache MP
+       server. Use ``grpc://`` for gRPC (default) or ``tcp://`` for ZMQ. A
+       bare ``localhost`` / ``127.0.0.1`` is normalized to ``grpc://`` by the
+       connector. Ignored when ``lmcache.mp.server_urls`` is set.
+   * - ``lmcache.mp.port``
+     - ``5555``
+     - Single-server deployment: port of the LMCache MP server. Must
+       match the server's ``--port``. Ignored when
+       ``lmcache.mp.server_urls`` is set.
+   * - ``lmcache.mp.api_key_file``
+     - *(unset)*
+     - File holding the API key this engine sends to the LMCache server. Use it
+       when the server requires a key and the engine should not hold the fleet
+       key: the inbound key set this server accepts is a different trust domain
+       from the key a caller presents. The file must hold exactly one non-empty
+       line. When unset, the request clients keep their ``LMCACHE_API_KEY`` /
+       ``LMCACHE_API_KEY_FILE`` fallback.
+   * - ``lmcache.mp.mq_timeout``
+     - ``300.0``
+     - Timeout (seconds) for blocking message-queue requests, including
+       the initial chunk-size query and KV cache
+       registration/unregistration. If the server does not respond within
+       this window, the connector raises ``ConnectionError`` on startup.
+   * - ``lmcache.mp.heartbeat_interval``
+     - ``10.0``
+     - Interval (seconds) between periodic heartbeat pings sent from the
+       connector to the server.
+   * - ``lmcache.mp.nonblocking_lookup_status``
+     - ``true``
+     - Poll lookup-status replies without blocking the scheduler by default.
+       Set to ``false`` to wait for each status RPC reply in the current
+       callback, for example when long prefill steps delay observation of an
+       already-ready reply. LOOKUP acknowledgement polling
+       remains asynchronous. Available with the current ``LMCacheMPConnector``.
+   * - ``lmcache.mp.eager_prefetch``
+     - ``false``
+     - Submit the LMCache lookup when a request enters vLLM's waiting queue,
+       allowing L2-to-L1 KV staging to overlap with scheduler queue wait.
+       Resumable requests are skipped because their token IDs may be incomplete
+       at enqueue time.
+   * - ``lmcache.mp.autostart``
+     - ``false``
+     - Whether vLLM worker 0 should start a local ``lmcache server`` process
+       before workers connect to it. Other local workers wait for the server to
+       become reachable. Only ``localhost`` and ``127.0.0.1`` are supported.
+       The URL scheme picks the server transport: ``grpc://`` or a host
+       without a scheme starts a gRPC server, and ``tcp://`` starts a
+       deprecated ZMQ server.
+       IPv6 endpoints, including ``::1``, raise ``ValueError`` before startup
+       for either transport.
+       Auto-start supports exactly one server endpoint; configuring
+       multiple ``lmcache.mp.server_urls`` raises ``ValueError`` during
+       connector initialization.
+       Starting a server needs the full ``lmcache`` distribution. With only
+       ``lmcache-client`` installed, worker 0 raises ``RuntimeError`` instead
+       of starting one when no server answers at the endpoint; a server that
+       is already running there is still used.
+   * - ``lmcache.mp.autostart.wait_timeout``
+     - ``90.0``
+     - Timeout (seconds) to wait for the auto-started server to respond to
+       ``PING`` requests. Must be positive and finite.
+   * - ``lmcache.mp.autostart.server_args``
+     - ``""``
+     - Extra command-line arguments passed to the auto-started MP HTTP server
+       process. Required server settings such as ``--l1-size-gb`` and
+       ``--eviction-policy`` must be supplied here. For example, pass
+       ``--l1-size-gb 20 --eviction-policy LRU``. Endpoint flags such as
+       ``--host``, ``--port``, ``--http-host``, and ``--transport`` are
+       rejected because the auto-started request and HTTP listeners are bound
+       to the local connector endpoint and its transport. If multiple auto-started MP servers run on the same host, pass
+       distinct ``--http-port`` values here to avoid HTTP frontend port
+       conflicts.
+   * - ``lmcache.mp.mp_transfer_mode``
+     - ``auto``
+     - Routing mode for the worker -> server transfer context. One of
+       ``auto`` (CUDA -> lmcache_driven, others -> engine_driven),
+       ``lmcache_driven`` (force the IPC / SHM zero-copy handle path —
+       LMCache server pulls data via device handles), or
+       ``engine_driven`` (force the worker-side gather/scatter copy
+       path). Overrides the ``LMCACHE_MP_TRANSFER_MODE`` env var when
+       set.
+   * - ``lmcache.mp.isolated_ipc``
+     - ``false``
+     - Assume the vLLM workers and the LMCache server run in containers
+       that share no host IPC namespace (``hostIPC``) and no common
+       ``/dev/shm``, and use IPC mechanisms that work there: on CUDA, raw
+       CUDA IPC memory handles for KV-cache registration and
+       timeline-semaphore events instead of CUDA interprocess *event*
+       handles. Set it together with the
+       server's ``--isolated-ipc`` flag -- a mismatch fails at event
+       import on whichever side receives the foreign handle.
+   * - ``lmcache.mp.use_vmm_api``
+     - auto-detected
+     - Selects VMM IPC when the engine allocates its KV cache through the
+       CUDA VMM API. LMCache detects vLLM's ``--enable-cumem-allocator`` and
+       resolved extensible-KV-cache mode automatically; set this key to
+       ``true`` or ``false`` only to override that result. VMM memory has no
+       legacy CUDA IPC handle, so KV-cache registration exports it via
+       ``cuMemExportToShareableHandle`` instead (a fabric handle when
+       the allocation is fabric-exportable -- requires an IMEX channel
+       device, e.g. ``NVIDIA_IMEX_CHANNELS=0`` -- or a POSIX fd
+       otherwise). POSIX fds reach the server over its fd channel,
+       ``/dev/shm/lmcache_fd_<port>.sock``, so the engine and the
+       server must share ``/dev/shm`` (``--ipc host``) and the server
+       URL must name a TCP port. The fd channel is Linux-only; on other
+       platforms the server skips it with an INFO message and registering
+       POSIX-fd KV caches fails on the worker with ``RuntimeError``.
+       Registrations without POSIX-fd handles remain available. Composes with
+       ``lmcache.mp.isolated_ipc`` for fabric-exportable pools; a
+       POSIX-fd-only pool under isolated IPC is rejected at
+       registration. vLLM sleep mode (``/sleep``,
+       ``/release_kv_cache_memory``) needs the connector shipped by
+       LMCache (``kv_connector_module_path``): it drops the server's
+       mapping of the KV cache before vLLM releases the memory, and maps
+       the new memory on wake-up.
+   * - ``lmcache.mp.lazy_offload``
+     - ``false``
+     - Buffer stores on the scheduler and submit them according to the
+       selected lazy-offload policy. Requires vLLM prefix caching. See
+       :doc:`lazy_offload` for behavior, limitations, and tuning guidance.
+   * - ``lmcache.mp.lazy_offload_policy``
+     - ``EVICTION_AWARE``
+     - Lazy drain policy. ``EVICTION_AWARE`` drains blocks near the GPU free
+       queue's eviction head. Set ``FIFO`` explicitly to keep the
+       count-triggered behavior.
+   * - ``lmcache.mp.lazy_offload_horizon_steps``
+     - ``2.5``
+     - ``EVICTION_AWARE`` only: estimated scheduler steps of block
+       consumption treated as imminent eviction. Must be greater than zero.
+       Larger values store earlier and reduce eviction losses, but may store
+       GPU-resident hot content and increase lower-tier eviction pressure.
+   * - ``lmcache.mp.lazy_offload_max_drain_per_step``
+     - ``64``
+     - ``EVICTION_AWARE`` only: maximum store operations emitted per
+       scheduler step. A value below the concurrent prefill admission rate
+       can lose buffered operations to eviction.
+   * - ``lmcache.mp.lazy_offload_max_deferral_seconds``
+     - ``0.0``
+     - ``EVICTION_AWARE`` only: how long a buffered operation may wait before
+       it is emitted regardless of eviction pressure. Not a hard bound: no
+       drain runs on a step that schedules no tokens, a request whose store
+       is already in flight is skipped, and due operations that do not fit
+       in ``max_drain_per_step`` wait for a later step. Zero leaves emission
+       entirely to the danger window. Set it below the reuse interval the
+       workload has to beat.
+   * - ``lmcache.mp.lazy_offload_threshold``
+     - ``100``
+     - ``FIFO`` only: number of finished buffered requests that triggers a
+       drain.
+   * - ``lmcache.mp.lazy_offload_select_count``
+     - ``10``
+     - ``FIFO`` only: maximum finished requests emitted by one drain.
+
+To let vLLM worker 0 start a local MP server automatically:
+
+.. code-block:: bash
+
+    vllm serve Qwen/Qwen3-14B \
+        --kv-transfer-config \
+        '{"kv_connector":"LMCacheMPConnector", "kv_role":"kv_both", "kv_connector_extra_config": {"lmcache.mp.autostart": true, "lmcache.mp.autostart.server_args": "--l1-size-gb 20 --eviction-policy LRU"}}'
+
+Auto-start is a convenience for single-node, single-server deployments. The MP
+server is a child of vLLM worker 0, not an independently managed service.
+
+.. note::
+
+   LMCache's adapter shutdown does not explicitly terminate this child, but
+   vLLM's process-tree cleanup may terminate it. Its lifetime depends on the
+   vLLM version and exit path; neither survival nor automatic cleanup is
+   guaranteed. Stop any remaining auto-started server when it is no longer
+   needed.
+
+For servers that must survive vLLM restarts or be shared across vLLM instances,
+and for multi-node TP/PP deployments, start and manage the server separately.
+For example, run the server in a separate terminal or service manager and leave
+auto-start disabled in vLLM:
+
+.. code-block:: bash
+
+    # Terminal 1: independently managed MP server
+    lmcache server --host 127.0.0.1 --port 5555 \
+        --http-host 127.0.0.1 --l1-size-gb 20 --eviction-policy LRU
+
+    # Terminal 2: connect-only vLLM instance
+    vllm serve Qwen/Qwen3-14B \
+        --kv-transfer-config '{
+            "kv_connector": "LMCacheMPConnector",
+            "kv_connector_module_path":
+                "lmcache.integration.vllm.lmcache_mp_connector",
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": {
+                "lmcache.mp.host": "127.0.0.1",
+                "lmcache.mp.port": 5555,
+                "lmcache.mp.autostart": false
+            }
+        }'
+
+Environment Variables
+---------------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Variable
+     - Description
+   * - ``LMCACHE_LOG_LEVEL``
+     - Log level for LMCache (``DEBUG``, ``INFO``, ``WARNING``, ``ERROR``).
+       Set to ``DEBUG`` to see L2 store activity, prefetch results, etc.
+   * - ``PYTHONHASHSEED``
+     - Set to a fixed value for reproducible hashing across processes
+       (relevant when using ``--hash-algorithm builtin``).
+   * - ``LMCACHE_TRACK_USAGE``
+     - Set to ``false`` to disable anonymous usage statistics (see below).
+   * - ``DO_NOT_TRACK``
+     - Set to ``1`` to disable anonymous usage statistics (cross-tool
+       convention).
+   * - ``LMCACHE_USAGE_TRACK_INTERVAL``
+     - Seconds between continuous usage-telemetry flushes (default
+       ``600``). See :ref:`usage-stats-collection`.
+
+Full Example
+------------
+
+.. code-block:: bash
+
+    lmcache server \
+        --host 0.0.0.0 \
+        --port 6555 \
+        --chunk-size 512 \
+        --max-workers 4 \
+        --max-gpu-workers 2 \
+        --hash-algorithm blake3 \
+        --engine-type default \
+        --lookup-hash-log-dir /data/lmcache/lookup_hashes \
+        --lookup-hash-log-rotation-interval 21600 \
+        --lookup-hash-log-rotation-max-size 104857600 \
+        --lookup-hash-log-max-files 100 \
+        --l1-size-gb 100 \
+        --l1-use-lazy \
+        --l1-init-size-gb 20 \
+        --l1-align-bytes 4096 \
+        --l1-write-ttl-seconds 600 \
+        --l1-read-ttl-seconds 300 \
+        --eviction-policy noop \
+        --l2-store-policy skip_l1 \
+        --eviction-trigger-watermark 0.9 \
+        --eviction-ratio 0.1 \
+        --l2-prefetch-policy skip_l1 \
+        --l2-prefetch-inflight-watermark 0.5 \
+        --periodic-notifier-interval-ms 5 \
+        --l2-adapter '{"type": "nixl_store", "backend": "POSIX", "backend_params": {"file_path": "/data/lmcache/l2", "use_direct_io": "false"}, "pool_size": 64}' \
+        --prometheus-port 9090 \
+        --metrics-sample-rate 0.01 \
+        --enable-tracing \
+        --otlp-endpoint http://localhost:4317
+
+KV-event registration
+---------------------
+
+``register_kv_cache`` takes a required final ``event_profile`` argument and
+returns the profile recorded for the registration. Every current integration
+passes ``None``; caching and router-visible events are unchanged. There is no
+configuration knob for enabling a native profile in this PR.
+
+``KVEventProfile(profile_id, block_size)`` is an immutable contract with a
+nonempty opaque identity and a positive engine event block size. Before any
+context, layout or liveness state changes, the server validates:
+
+* positive world size and a block size that divides the server chunk size;
+* one full-attention engine block address space with the declared block size;
+* agreement across active registrations for the same model and world size,
+  including whether a profile is present;
+* no model/world change for an existing instance when a profile is involved.
+
+A rejection raises ``MPRequestError`` with the server's reason. Its code is
+``INVALID_ARGUMENT`` on gRPC and ``invalid_argument`` on ZMQ; ZMQ details also
+include the operation name. Transport failures keep their existing behavior:
+gRPC raises ``MPServerUnavailableError``, while a ZMQ wait can expire with
+``LMCacheTimeoutError``.
+
+With ``None``, gRPC's optional request field is absent and the response is
+empty, preserving both byte strings. ZMQ registration always includes one
+additional payload frame, so behavior is identical but request bytes are not.
+Its ``None`` success reply still contains no payload frame. QStore's request
+and response bytes are unchanged.
+
+* An older gRPC worker can register with a newer server: absence means ``None``.
+* A newer gRPC worker can register with an older server, but its returned
+  profile is absent. A future profile sender must compare the returned value.
+* An older ZMQ worker receives an explicit payload-count rejection from a
+  newer server. A newer worker calling an older server times out because that
+  server cannot answer the longer request. Upgrade ZMQ deployments together.
+
+There is no handshake or fallback. Profiles live until unregister, reap or
+shutdown. STORE bindings, the first integration sending and checking a
+profile, and native event records remain later steps of
+`issue #5932 <https://github.com/LMCache/LMCache/issues/5932>`_.
+
+Anonymous Usage Statistics
+--------------------------
+
+The MP server reports anonymous usage statistics: a one-time
+environment/configuration snapshot at startup and interval counters
+(tokens retrieved/stored, bytes stored, uptime) every
+``LMCACHE_USAGE_TRACK_INTERVAL`` seconds. No prompts, keys, KV-cache
+data, model names, or ``--instance-id`` are ever sent, and reporting can
+never affect serving. Opt out with ``LMCACHE_TRACK_USAGE=false`` or
+``DO_NOT_TRACK=1``; see :ref:`usage-stats-collection` for details.
