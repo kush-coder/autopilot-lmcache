@@ -11,6 +11,6 @@ opentelemetry-api>=1.20.0
 prometheus_client>=0.18.0
 protobuf>=6.31.1,<7
 pyyaml
-pyzmq>=25.0.0
+pyzmq>=27.3.0
 requests
 torch
